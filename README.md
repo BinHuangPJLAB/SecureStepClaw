@@ -306,6 +306,8 @@ List agents:
 openclaw steprollback agents
 ```
 
+If your OpenClaw config only defines `agents.defaults`, Step Rollback shows the usable runtime agent as `main`. The CLI also accepts `--agent default` and `--agent defaults` as aliases for that default runtime agent.
+
 List sessions for an agent:
 
 ```bash

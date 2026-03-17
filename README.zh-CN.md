@@ -307,6 +307,8 @@ openclaw gateway run
 openclaw steprollback agents
 ```
 
+如果你的 OpenClaw 配置只有 `agents.defaults`，Step Rollback 会把真正可用的运行时 agent 显示成 `main`。CLI 同时也接受 `--agent default` 和 `--agent defaults` 作为这个默认运行时 agent 的别名。
+
 按 agent 列出 sessions：
 
 ```bash

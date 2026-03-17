@@ -100,6 +100,26 @@ async function captureConsoleLog(fn) {
   return output.join("\n");
 }
 
+async function withEnv(name, value, fn) {
+  const previous = process.env[name];
+
+  if (value === undefined || value === null) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
+
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) {
+      delete process.env[name];
+    } else {
+      process.env[name] = previous;
+    }
+  }
+}
+
 test("creates checkpoints, rolls back workspace state, and continues from the checkpoint", async () => {
   const fixture = await createFixture();
   const calls = {
@@ -236,6 +256,62 @@ test("creates checkpoints, rolls back workspace state, and continues from the ch
   });
   assert.equal(branch.sourceSessionId, "session-1");
   assert.equal(branch.newSessionId, "session-branch-1");
+});
+
+test("builds checkpoint summaries from tool targets and exec commands", async () => {
+  const fixture = await createFixture();
+  const plugin = createStepRollbackPlugin({
+    config: {
+      workspaceRoots: [fixture.workspace],
+      checkpointDir: fixture.checkpointDir,
+      registryDir: fixture.registryDir,
+      runtimeDir: fixture.runtimeDir,
+      reportsDir: fixture.reportsDir
+    }
+  });
+
+  const reportPath = path.join(fixture.workspace, "docs", "report.pdf");
+  await fs.mkdir(path.dirname(reportPath), { recursive: true });
+  await fs.writeFile(reportPath, "v1\n", "utf8");
+
+  await plugin.hooks.sessionStart({
+    agentId: "main",
+    sessionId: "session-summary",
+    runId: "run-summary"
+  });
+
+  await plugin.hooks.beforeToolCall({
+    agentId: "main",
+    sessionId: "session-summary",
+    entryId: "entry-write",
+    nodeIndex: 1,
+    toolName: "write",
+    runId: "run-summary",
+    params: {
+      file_path: path.join(fixture.workspace, "overview.txt"),
+      content: "hello"
+    }
+  });
+
+  await plugin.hooks.beforeToolCall({
+    agentId: "main",
+    sessionId: "session-summary",
+    entryId: "entry-exec",
+    nodeIndex: 2,
+    toolName: "exec",
+    runId: "run-summary",
+    params: {
+      command: `rm ${reportPath}`
+    }
+  });
+
+  const { checkpoints } = await plugin.methods["steprollback.checkpoints.list"]({
+    agentId: "main",
+    sessionId: "session-summary"
+  });
+
+  assert.equal(checkpoints[0].summary, "before tool write overview.txt");
+  assert.equal(checkpoints[1].summary, "before tool exec delete report.pdf");
 });
 
 test("resolves relative paths even when process cwd is unavailable", () => {
@@ -421,6 +497,7 @@ test("registers a native OpenClaw plugin and drives rollback through registered 
     clis: []
   };
   const gatewayCalls = [];
+  const subagentCalls = [];
   const logs = [];
   const toolCallId = "chatcmpl-tool-native";
   const transcript = await writeSessionTranscript(fixture.root, "main", "native-session", [
@@ -510,30 +587,31 @@ test("registers a native OpenClaw plugin and drives rollback through registered 
       registered.clis.push({ factory, meta });
     },
     runtime: {
+      subagent: {
+        async run(params) {
+          subagentCalls.push(params);
+          const currentStore = JSON.parse(await fs.readFile(nativeSessionStorePath, "utf8"));
+
+          if (params.sessionKey && !currentStore[params.sessionKey]) {
+            currentStore[params.sessionKey] = {
+              sessionId: "native-session-branch",
+              label: "Rollback branch",
+              updatedAt: "2026-03-17T00:00:01.000Z"
+            };
+            await fs.writeFile(nativeSessionStorePath, `${JSON.stringify(currentStore, null, 2)}\n`, "utf8");
+          }
+
+          return {
+            runId: `subagent:${params.sessionKey}:tail`
+          };
+        }
+      },
       gateway: {
         async call(method, params) {
           gatewayCalls.push({ method, params });
 
           if (method === "agent" && params.message === "/stop") {
             return { runId: "stop-run", acceptedAt: "2026-03-17T00:00:00.000Z" };
-          }
-
-          if (method === "agent") {
-            const currentStore = JSON.parse(await fs.readFile(nativeSessionStorePath, "utf8"));
-
-            if (params.sessionKey && !currentStore[params.sessionKey]) {
-              currentStore[params.sessionKey] = {
-                sessionId: "native-session-branch",
-                label: params.label ?? "Rollback branch",
-                updatedAt: "2026-03-17T00:00:01.000Z"
-              };
-              await fs.writeFile(nativeSessionStorePath, `${JSON.stringify(currentStore, null, 2)}\n`, "utf8");
-            }
-
-            return {
-              runId: `run:${params.sessionKey ?? params.sessionId}:tail`,
-              acceptedAt: "2026-03-17T00:00:01.000Z"
-            };
           }
 
           return undefined;
@@ -618,12 +696,11 @@ test("registers a native OpenClaw plugin and drives rollback through registered 
   assert.equal(continueResponse.newSessionId, "native-session-branch");
   assert.match(continueResponse.newSessionKey, /^agent:main:direct:step-rollback-br_0001$/);
   assert.equal(
-    gatewayCalls.some(
+    subagentCalls.some(
       (call) =>
-        call.method === "agent" &&
-        call.params.sessionKey === continueResponse.newSessionKey &&
-        !("resumeFromEntryId" in call.params) &&
-        call.params.message === "Continue from the restored checkpoint."
+        call.sessionKey === continueResponse.newSessionKey &&
+        call.message === "Continue from the restored checkpoint." &&
+        call.deliver === false
     ),
     true
   );
@@ -696,6 +773,7 @@ test("offers flag-based CLI commands for agents, sessions, rollback, and continu
     clis: []
   };
   const cliGatewayCalls = [];
+  const cliGatewayBehaviors = [];
   const sessionStoreTemplate = path.join(fixture.root, "agents", "{agentId}", "sessions", "sessions.json");
   const sessionStorePath = sessionStoreTemplate.replace("{agentId}", "main");
   const toolCallId = "chatcmpl-tool-cli";
@@ -799,8 +877,9 @@ test("offers flag-based CLI commands for agents, sessions, rollback, and continu
         return { sessionId: "session-checkout-cli" };
       }
     },
-    cliGatewayInvoker: async (methodName, params) => {
+    cliGatewayInvoker: async (methodName, params, behavior) => {
       cliGatewayCalls.push({ methodName, params });
+      cliGatewayBehaviors.push(behavior ?? {});
       const handler = registered.methods.get(methodName);
       return handler ? handler({ params }) : undefined;
     }
@@ -830,13 +909,19 @@ test("offers flag-based CLI commands for agents, sessions, rollback, and continu
   assert.match(agentsOutput, /main/);
 
   const sessionsOutput = await captureConsoleLog(async () => {
-    await cliHarness.commands.get("steprollback sessions").action({ agent: "main" });
+    await withEnv("NO_COLOR", undefined, async () =>
+      withEnv("FORCE_COLOR", "1", async () => {
+        await cliHarness.commands.get("steprollback sessions").action({ agent: "main" });
+      })
+    );
   });
   assert.match(sessionsOutput, /Mark/);
   assert.match(sessionsOutput, /latest/);
   assert.match(sessionsOutput, /session-cli/);
   assert.match(sessionsOutput, /CLI test session/);
   assert.match(sessionsOutput, /2026-03-17 \d{2}:\d{2}:\d{2}/);
+  assert.match(sessionsOutput, /\u001b\[[0-9;]*mlatest\u001b\[0m/);
+  assert.match(sessionsOutput, /\u001b\[[0-9;]*msession-cli\u001b\[0m/);
 
   const checkpointsOutput = await captureConsoleLog(async () => {
     await cliHarness.commands.get("steprollback checkpoints").action({
@@ -884,4 +969,111 @@ test("offers flag-based CLI commands for agents, sessions, rollback, and continu
     ),
     true
   );
+  assert.equal(
+    cliGatewayBehaviors.some(
+      (behavior, index) =>
+        cliGatewayCalls[index]?.methodName === "steprollback.continue" &&
+        behavior.expectFinal === true
+    ),
+    false
+  );
+});
+
+test("maps agents.defaults to main and accepts default aliases in CLI and Gateway methods", async () => {
+  const fixture = await createFixture();
+  const registered = {
+    methods: new Map(),
+    hooks: new Map(),
+    services: [],
+    clis: []
+  };
+  const sessionStoreTemplate = path.join(fixture.root, "agents", "{agentId}", "sessions", "sessions.json");
+  const sessionStorePath = sessionStoreTemplate.replace("{agentId}", "main");
+
+  await fs.mkdir(path.dirname(sessionStorePath), { recursive: true });
+  await fs.writeFile(
+    sessionStorePath,
+    `${JSON.stringify({
+      "agent:main:main": {
+        sessionId: "session-defaults",
+        updatedAt: "2026-03-17T18:27:25.000Z",
+        label: "Defaults-backed session"
+      }
+    }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const api = {
+    config: {
+      agents: {
+        defaults: {
+          workspace: fixture.workspace,
+          model: {
+            primary: "vllm/Intern-S1-Pro"
+          }
+        }
+      },
+      session: {
+        storePath: sessionStoreTemplate
+      },
+      plugins: {
+        entries: {
+          "step-rollback": {
+            config: {
+              workspaceRoots: [fixture.workspace],
+              checkpointDir: fixture.checkpointDir,
+              registryDir: fixture.registryDir,
+              runtimeDir: fixture.runtimeDir,
+              reportsDir: fixture.reportsDir
+            }
+          }
+        }
+      }
+    },
+    logger: {
+      info() {},
+      warn() {},
+      error() {},
+      debug() {}
+    },
+    registerGatewayMethod(name, handler) {
+      registered.methods.set(name, handler);
+    },
+    registerHook(name, handler, options) {
+      registered.hooks.set(name, { handler, options });
+    },
+    on(name, handler, options) {
+      registered.hooks.set(name, { handler, options });
+    },
+    registerService(service) {
+      registered.services.push(service);
+    },
+    registerCli(factory, meta) {
+      registered.clis.push({ factory, meta });
+    }
+  };
+
+  await createNativeStepRollbackPlugin().register(api);
+
+  const cliHarness = createFakeProgram();
+  registered.clis[0].factory({ program: cliHarness.program });
+
+  const agentsOutput = await captureConsoleLog(async () => {
+    await cliHarness.commands.get("steprollback agents").action({});
+  });
+  assert.match(agentsOutput, /\bmain\b/);
+  assert.doesNotMatch(agentsOutput, /\bdefaults\b/);
+
+  const sessionsOutput = await captureConsoleLog(async () => {
+    await cliHarness.commands.get("steprollback sessions").action({ agent: "default" });
+  });
+  assert.match(sessionsOutput, /session-defaults/);
+
+  const rollbackStatus = await registered.methods.get("steprollback.rollback.status")({
+    params: {
+      agentId: "defaults",
+      sessionId: "session-defaults"
+    }
+  });
+  assert.equal(rollbackStatus.agentId, "main");
 });

@@ -18,6 +18,219 @@ import {
 } from "../core/utils.js";
 
 const execFileAsync = promisify(execFile);
+const TARGET_PARAM_KEYS = [
+  "targetPath",
+  "target_path",
+  "path",
+  "filePath",
+  "file_path",
+  "filepath",
+  "file",
+  "filename",
+  "name",
+  "target",
+  "destination",
+  "destinationPath",
+  "destination_path",
+  "dest",
+  "output",
+  "outputPath",
+  "output_path",
+  "source",
+  "sourcePath",
+  "source_path",
+  "src",
+  "url",
+  "uri"
+];
+const COMMAND_PARAM_KEYS = ["command", "cmd", "script", "shell", "input", "text"];
+
+function compactWhitespace(value) {
+  return String(value ?? "")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function shortenSummaryValue(value, maxLength = 96) {
+  const normalized = compactWhitespace(value);
+
+  if (!normalized) {
+    return null;
+  }
+
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function summarizePathLike(value) {
+  const raw = compactWhitespace(value);
+
+  if (!raw) {
+    return null;
+  }
+
+  const baseName = path.basename(raw);
+  if (baseName && baseName !== raw && /\.[^./]+$/.test(baseName) && baseName.length <= 32) {
+    return baseName;
+  }
+
+  const normalized = shortenSummaryValue(raw, 72);
+
+  if (!normalized) {
+    return null;
+  }
+
+  const parts = normalized.split(/[\\/]+/).filter(Boolean);
+
+  if (normalized.length <= 40 || parts.length < 2) {
+    return normalized;
+  }
+
+  return `.../${parts.slice(-2).join("/")}`;
+}
+
+function findNestedValueByKeys(value, keys, seen = new Set(), depth = 0) {
+  if (!value || typeof value !== "object" || depth > 4 || seen.has(value)) {
+    return null;
+  }
+
+  seen.add(value);
+
+  for (const key of keys) {
+    if (value[key] !== undefined && value[key] !== null && value[key] !== "") {
+      return value[key];
+    }
+  }
+
+  const entries = Array.isArray(value) ? value : Object.values(value);
+
+  for (const entry of entries) {
+    const nested = findNestedValueByKeys(entry, keys, seen, depth + 1);
+    if (nested !== null) {
+      return nested;
+    }
+  }
+
+  return null;
+}
+
+function summarizeTargetValue(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  if (typeof value === "string") {
+    return summarizePathLike(value);
+  }
+
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+
+  if (Array.isArray(value)) {
+    const items = value
+      .map((entry) => summarizeTargetValue(entry))
+      .filter(Boolean);
+
+    if (!items.length) {
+      return null;
+    }
+
+    return shortenSummaryValue(items.slice(0, 2).join(", "), 72);
+  }
+
+  if (typeof value === "object") {
+    const nested = findNestedValueByKeys(value, TARGET_PARAM_KEYS);
+    return nested === null ? null : summarizeTargetValue(nested);
+  }
+
+  return shortenSummaryValue(value, 72);
+}
+
+function extractCommandText(params) {
+  const command = findNestedValueByKeys(params, COMMAND_PARAM_KEYS);
+  return typeof command === "string" ? compactWhitespace(command) : null;
+}
+
+function unquoteShellToken(token) {
+  return String(token ?? "").replace(/^['"]|['"]$/g, "");
+}
+
+function summarizeExecCommand(commandText) {
+  const raw = compactWhitespace(commandText);
+
+  if (!raw) {
+    return null;
+  }
+
+  const compact = shortenSummaryValue(raw, 88);
+  const tokens = raw.match(/"[^"]+"|'[^']+'|\S+/g)?.map(unquoteShellToken) ?? [];
+  const firstCommandIndex = tokens.findIndex((token) => !token.startsWith("-"));
+  const command = firstCommandIndex >= 0 ? path.basename(tokens[firstCommandIndex]).toLowerCase() : "";
+  const targetToken = tokens.slice(firstCommandIndex + 1).find((token) => token && !token.startsWith("-"));
+  const target = summarizeTargetValue(targetToken);
+
+  switch (command) {
+    case "rm":
+    case "unlink":
+    case "del":
+      return target ? `delete ${target}` : "delete files";
+    case "mv":
+      return target ? `move ${target}` : compact;
+    case "cp":
+      return target ? `copy ${target}` : compact;
+    case "mkdir":
+      return target ? `create ${target}` : compact;
+    case "cat":
+    case "less":
+      return target ? `read ${target}` : compact;
+    default:
+      return compact;
+  }
+}
+
+function buildCheckpointSummary(ctx) {
+  const toolName = shortenSummaryValue(ctx?.toolName, 24) ?? "tool";
+  const params = ctx?.params;
+
+  if (typeof params === "string") {
+    if (toolName.toLowerCase() === "exec") {
+      const execSummary = summarizeExecCommand(params);
+      if (execSummary) {
+        return `before tool ${toolName} ${execSummary}`;
+      }
+    }
+
+    const text = shortenSummaryValue(params, 72);
+    if (text) {
+      return `before tool ${toolName} ${text}`;
+    }
+  }
+
+  if (params && typeof params === "object") {
+    if (toolName.toLowerCase() === "exec") {
+      const execSummary = summarizeExecCommand(extractCommandText(params));
+      if (execSummary) {
+        return `before tool ${toolName} ${execSummary}`;
+      }
+    }
+
+    const target = summarizeTargetValue(findNestedValueByKeys(params, TARGET_PARAM_KEYS));
+    if (target) {
+      return `before tool ${toolName} ${target}`;
+    }
+
+    const command = extractCommandText(params);
+    if (command) {
+      return `before tool ${toolName} ${shortenSummaryValue(command, 88)}`;
+    }
+  }
+
+  return `before tool ${toolName}`;
+}
 
 export class CheckpointManager {
   constructor({ config, registry, runtimeCursorManager, sequenceStore, logger }) {
@@ -85,7 +298,7 @@ export class CheckpointManager {
         commitId: entry.commitId ?? null
       })),
       status: "ready",
-      summary: `before tool ${ctx.toolName}`
+      summary: buildCheckpointSummary(ctx)
     };
 
     await this.registry.add(record);
@@ -140,10 +353,17 @@ export class CheckpointManager {
       `[step-rollback] reconciling checkpoint '${candidate.checkpointId}' to entry='${ctx.entryId}' node='${ctx.nodeIndex}' toolCallId='${ctx.toolCallId}'`
     );
 
+    const nextSummary = buildCheckpointSummary({
+      ...candidate,
+      ...ctx,
+      toolName: ctx.toolName ?? candidate.toolName
+    });
+
     return this.registry.update(candidate.checkpointId, (current) => {
       current.entryId = ctx.entryId;
       current.nodeIndex = ctx.nodeIndex;
       current.toolCallId = ctx.toolCallId ?? current.toolCallId ?? null;
+      current.summary = nextSummary;
       return current;
     });
   }

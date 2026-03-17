@@ -35,6 +35,13 @@ const GATEWAY_METHOD_NAMES = [
 ];
 
 const execFileAsync = promisify(execFile);
+const ANSI_PATTERN = /\u001b\[[0-9;]*m/g;
+const ANSI_RESET = "\u001b[0m";
+const ANSI_BOLD = "\u001b[1m";
+const ANSI_DIM = "\u001b[2m";
+const ANSI_GREEN = "\u001b[32m";
+const ANSI_CYAN = "\u001b[36m";
+const ANSI_YELLOW = "\u001b[33m";
 
 function createLogger(api) {
   const noop = () => { };
@@ -300,7 +307,8 @@ function extractToolCallsFromAssistantEntry(entry) {
     ) {
       toolCalls.push({
         toolCallId,
-        toolName
+        toolName,
+        params: pickFirst(item.arguments, item.params, item.input, item.args)
       });
     }
   }
@@ -357,6 +365,7 @@ async function resolveToolCallEntryFromTranscript(api, normalized, logger) {
         return {
           entryId: pickFirst(entry.id, normalized.toolCallId),
           nodeIndex,
+          params: toolCall.params,
           transcriptPath
         };
       }
@@ -384,6 +393,7 @@ async function resolveToolHookContext(api, engine, normalized, logger) {
     if (transcriptMatch) {
       enriched.entryId = enriched.entryId ?? transcriptMatch.entryId;
       enriched.nodeIndex = Number.isInteger(enriched.nodeIndex) ? enriched.nodeIndex : transcriptMatch.nodeIndex;
+      enriched.params = enriched.params ?? transcriptMatch.params;
       logger.info?.(
         `[${manifest.id}] resolved tool checkpoint context from transcript toolCallId='${enriched.toolCallId}' entry='${enriched.entryId}' node='${enriched.nodeIndex}'`
       );
@@ -629,6 +639,71 @@ function timestampSortValue(...values) {
   return 0;
 }
 
+function resolveDefaultAgentId(api) {
+  const agentsConfig = api?.config?.agents;
+  const configuredList = Array.isArray(agentsConfig?.list)
+    ? agentsConfig.list
+    : Array.isArray(agentsConfig?.entries)
+      ? agentsConfig.entries
+      : [];
+  const defaultEntry = configuredList.find(
+    (entry) => entry && typeof entry === "object" && entry.default === true && typeof entry.id === "string" && entry.id.trim()
+  );
+
+  if (defaultEntry) {
+    return sanitizeSessionToken(defaultEntry.id, "main");
+  }
+
+  const routingDefault = typeof api?.config?.routing?.defaultAgentId === "string"
+    ? api.config.routing.defaultAgentId.trim()
+    : "";
+
+  if (routingDefault) {
+    return sanitizeSessionToken(routingDefault, "main");
+  }
+
+  const firstEntry = configuredList.find(
+    (entry) => entry && typeof entry === "object" && typeof entry.id === "string" && entry.id.trim()
+  );
+
+  if (firstEntry) {
+    return sanitizeSessionToken(firstEntry.id, "main");
+  }
+
+  return "main";
+}
+
+function normalizeAgentIdInput(api, value) {
+  const defaultAgentId = resolveDefaultAgentId(api);
+  const raw = typeof value === "string" ? value.trim() : "";
+
+  if (!raw) {
+    return defaultAgentId;
+  }
+
+  const normalized = sanitizeSessionToken(raw, defaultAgentId);
+
+  if (normalized === "default" || normalized === "defaults") {
+    return defaultAgentId;
+  }
+
+  return normalized;
+}
+
+function normalizeExternalParams(api, params) {
+  if (!params || typeof params !== "object" || Array.isArray(params)) {
+    return params ?? {};
+  }
+
+  const nextParams = { ...params };
+
+  if (typeof nextParams.agentId === "string") {
+    nextParams.agentId = normalizeAgentIdInput(api, nextParams.agentId);
+  }
+
+  return nextParams;
+}
+
 function getConfiguredAgents(api) {
   const configured = pickFirst(
     api?.config?.agents?.list,
@@ -658,15 +733,36 @@ function getConfiguredAgents(api) {
   }
 
   if (configured && typeof configured === "object") {
-    return Object.entries(configured).map(([id, entry]) => ({
-      id,
-      name: pickFirst(entry?.name, id),
-      workspace: pickFirst(entry?.workspace, entry?.workspaceRoot, entry?.cwd, entry?.root),
-      model: pickFirst(entry?.model, entry?.defaultModel)
-    }));
+    const explicitEntries = Object.entries(configured)
+      .filter(([id]) => !["defaults", "list", "entries"].includes(id))
+      .map(([id, entry]) => ({
+        id: sanitizeSessionToken(id, "main"),
+        name: pickFirst(entry?.name, id),
+        workspace: pickFirst(entry?.workspace, entry?.workspaceRoot, entry?.cwd, entry?.root),
+        model: pickFirst(entry?.model, entry?.defaultModel)
+      }))
+      .filter((entry) => entry?.id);
+
+    if (explicitEntries.length > 0) {
+      return explicitEntries;
+    }
+
+    const defaultsEntry = configured.defaults;
+
+    if (defaultsEntry && typeof defaultsEntry === "object") {
+      const defaultAgentId = resolveDefaultAgentId(api);
+
+      return [{
+        id: defaultAgentId,
+        name: pickFirst(defaultsEntry?.name, defaultAgentId),
+        workspace: pickFirst(defaultsEntry?.workspace, defaultsEntry?.workspaceRoot, defaultsEntry?.cwd, defaultsEntry?.root),
+        model: pickFirst(defaultsEntry?.model, defaultsEntry?.defaultModel)
+      }];
+    }
   }
 
-  return [{ id: "main", name: "main" }];
+  const defaultAgentId = resolveDefaultAgentId(api);
+  return [{ id: defaultAgentId, name: defaultAgentId }];
 }
 
 function resolveSessionIndexPath(api, agentId) {
@@ -688,7 +784,8 @@ function resolveSessionIndexPath(api, agentId) {
 }
 
 async function listSessionsForAgent(api, agentId) {
-  const sessionIndexPath = resolveSessionIndexPath(api, agentId);
+  const resolvedAgentId = normalizeAgentIdInput(api, agentId);
+  const sessionIndexPath = resolveSessionIndexPath(api, resolvedAgentId);
   const contents = await readJson(sessionIndexPath, []);
 
   const sessions = normalizeSessionStoreRecords(contents)
@@ -737,6 +834,29 @@ async function resolveSessionRecord(api, agentId, reference = {}) {
   }) ?? null;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function resolveSessionRecordEventually(api, agentId, reference = {}, options = {}) {
+  const attempts = Math.max(1, options.attempts ?? 5);
+  const delayMs = Math.max(0, options.delayMs ?? 50);
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const match = await resolveSessionRecord(api, agentId, reference);
+
+    if (match || attempt === attempts - 1) {
+      return match;
+    }
+
+    await sleep(delayMs);
+  }
+
+  return null;
+}
+
 function sanitizeSessionToken(value, fallback = "branch") {
   const normalized = String(value ?? "")
     .trim()
@@ -768,10 +888,83 @@ function formatValue(value) {
   return String(value);
 }
 
+function stripAnsi(value) {
+  return String(value ?? "").replace(ANSI_PATTERN, "");
+}
+
+function visibleWidth(value) {
+  return stripAnsi(formatValue(value)).length;
+}
+
+function padVisibleValue(value, width) {
+  const text = formatValue(value);
+  return `${text}${" ".repeat(Math.max(0, width - stripAnsi(text).length))}`;
+}
+
+function supportsAnsiColor() {
+  if (process.env.NO_COLOR !== undefined) {
+    return false;
+  }
+
+  if (process.env.FORCE_COLOR && process.env.FORCE_COLOR !== "0") {
+    return true;
+  }
+
+  return Boolean(process.stdout?.isTTY);
+}
+
+function colorize(value, ...codes) {
+  const text = String(value ?? "");
+
+  if (!text || !supportsAnsiColor() || !codes.length) {
+    return text;
+  }
+
+  return `${codes.join("")}${text}${ANSI_RESET}`;
+}
+
+function highlightSessionRow(row) {
+  if (!supportsAnsiColor()) {
+    return row;
+  }
+
+  const isLatest = row?.marker === "latest";
+
+  return {
+    ...row,
+    marker: isLatest ? colorize(row.marker, ANSI_BOLD, ANSI_GREEN) : row.marker,
+    sessionId: colorize(row.sessionId, isLatest ? ANSI_BOLD : ANSI_DIM, ANSI_CYAN),
+    title: isLatest ? colorize(row.title, ANSI_BOLD) : row.title
+  };
+}
+
+function highlightCheckpointRow(row) {
+  if (!supportsAnsiColor()) {
+    return row;
+  }
+
+  const statusColors = {
+    ready: [ANSI_CYAN],
+    restored: [ANSI_BOLD, ANSI_GREEN],
+    restoring: [ANSI_YELLOW],
+    failed: [ANSI_BOLD, ANSI_YELLOW]
+  };
+  const codes = statusColors[row?.status];
+
+  if (!codes) {
+    return row;
+  }
+
+  return {
+    ...row,
+    status: colorize(row.status, ...codes)
+  };
+}
+
 function renderTable(rows, columns) {
   const widths = columns.map((column) => {
     const headerWidth = column.label.length;
-    const valueWidth = rows.reduce((max, row) => Math.max(max, formatValue(row[column.key]).length), 0);
+    const valueWidth = rows.reduce((max, row) => Math.max(max, visibleWidth(row[column.key])), 0);
     return Math.max(headerWidth, valueWidth);
   });
 
@@ -781,7 +974,7 @@ function renderTable(rows, columns) {
   const divider = widths.map((width) => "-".repeat(width)).join("  ");
   const lines = rows.map((row) =>
     columns
-      .map((column, index) => formatValue(row[column.key]).padEnd(widths[index], " "))
+      .map((column, index) => padVisibleValue(row[column.key], widths[index]))
       .join("  ")
   );
 
@@ -799,7 +992,11 @@ function printRows(rows, columns, options = {}) {
     return;
   }
 
-  console.log(renderTable(rows, columns));
+  const printableRows = typeof options.transformRow === "function"
+    ? rows.map((row, index) => options.transformRow(row, index, rows))
+    : rows;
+
+  console.log(renderTable(printableRows, columns));
 }
 
 function printObject(value, options = {}) {
@@ -864,6 +1061,7 @@ function createCliMethodInvoker(api, engine, logger, options = {}) {
     : null;
 
   return async (methodName, params, behavior = {}) => {
+    const normalizedParams = normalizeExternalParams(api, params);
     const {
       preferGateway = true,
       fallbackToLocal = false,
@@ -871,7 +1069,7 @@ function createCliMethodInvoker(api, engine, logger, options = {}) {
     } = behavior;
 
     if (preferGateway) {
-      const rpcResult = await callGatewayMethod(api, methodName, params);
+      const rpcResult = await callGatewayMethod(api, methodName, normalizedParams);
 
       if (rpcResult !== undefined) {
         logger.debug?.(`[${manifest.id}] CLI delegated '${methodName}' through an exposed Gateway caller`);
@@ -880,12 +1078,12 @@ function createCliMethodInvoker(api, engine, logger, options = {}) {
 
       if (externalGatewayInvoker) {
         logger.debug?.(`[${manifest.id}] CLI delegated '${methodName}' through the configured Gateway invoker`);
-        return await externalGatewayInvoker(methodName, params, { expectFinal });
+        return await externalGatewayInvoker(methodName, normalizedParams, { expectFinal });
       }
 
       try {
         logger.debug?.(`[${manifest.id}] CLI delegated '${methodName}' through 'openclaw gateway call'`);
-        return await invokeGatewayViaCli(methodName, params, {
+        return await invokeGatewayViaCli(methodName, normalizedParams, {
           expectFinal,
           gatewayCommand: options.gatewayCommand,
           cliCwd: options.cliCwd
@@ -895,7 +1093,7 @@ function createCliMethodInvoker(api, engine, logger, options = {}) {
           throw new StepRollbackError(
             "GATEWAY_CALL_FAILED",
             `Command '${methodName}' requires a live OpenClaw Gateway connection. Restart Gateway and try again. ${toStepRollbackError(error).message}`,
-            { methodName, params }
+            { methodName, params: normalizedParams }
           );
         }
 
@@ -911,11 +1109,11 @@ function createCliMethodInvoker(api, engine, logger, options = {}) {
       throw new StepRollbackError(
         "GATEWAY_CALL_FAILED",
         `Step Rollback could not resolve a handler for '${methodName}'.`,
-        { methodName, params }
+        { methodName, params: normalizedParams }
       );
     }
 
-    return localMethod(params);
+    return localMethod(normalizedParams);
   };
 }
 
@@ -972,6 +1170,33 @@ function createNativeHostBridge(api, logger) {
       const targetSessionId = sessionId ?? knownSession?.sessionId;
       const syntheticMessage = prompt?.trim() || "Continue from the restored checkpoint.";
       const branchLabel = label ?? buildBranchSessionLabel(sourceSessionId ?? targetSessionId ?? "session", branchId ?? "continue");
+
+      if (targetSessionKey && typeof api?.runtime?.subagent?.run === "function") {
+        try {
+          const subagentResult = await api.runtime.subagent.run({
+            sessionKey: targetSessionKey,
+            message: syntheticMessage,
+            deliver: false
+          });
+          const resolvedSession = await resolveSessionRecordEventually(api, agentId, {
+            sessionId: targetSessionId,
+            sessionKey: targetSessionKey
+          });
+
+          return {
+            started: true,
+            runId: subagentResult?.runId ?? null,
+            sessionId: resolvedSession?.sessionId ?? targetSessionId ?? null,
+            sessionKey: resolvedSession?.sessionKey ?? targetSessionKey ?? null,
+            label: branchLabel
+          };
+        } catch (error) {
+          logger.warn?.(
+            `[${manifest.id}] runtime.subagent.run could not continue branch session '${targetSessionKey}': ${error instanceof Error ? error.message : error}`
+          );
+        }
+      }
+
       const rpcResult = await callGatewayMethod(api, "agent", {
         agentId,
         ...(targetSessionKey ? { sessionKey: targetSessionKey } : {}),
@@ -984,7 +1209,7 @@ function createNativeHostBridge(api, logger) {
 
       if (rpcResult !== undefined) {
         const unwrapped = unwrapRpcResult(rpcResult);
-        const resolvedSession = await resolveSessionRecord(api, agentId, {
+        const resolvedSession = await resolveSessionRecordEventually(api, agentId, {
           sessionId: targetSessionId,
           sessionKey: targetSessionKey
         });
@@ -1022,7 +1247,7 @@ function createNativeHostBridge(api, logger) {
 
       throw new StepRollbackError(
         "CONTINUE_START_FAILED",
-        "OpenClaw did not expose a Gateway caller or startRun helper that the plugin could use to continue in a branched session.",
+        "OpenClaw did not expose runtime.subagent.run, a Gateway caller, or a startRun helper that the plugin could use to continue in a branched session.",
         { agentId, sessionId: targetSessionId, sessionKey: targetSessionKey, entryId }
       );
     },
@@ -1064,7 +1289,7 @@ function registerGatewayMethods(api, engine, logger) {
   for (const methodName of GATEWAY_METHOD_NAMES) {
     api.registerGatewayMethod(methodName, async (request = {}) => {
       try {
-        const result = await engine.methods[methodName](extractGatewayParams(request));
+        const result = await engine.methods[methodName](normalizeExternalParams(api, extractGatewayParams(request)));
 
         if (typeof request.respond === "function") {
           request.respond(true, result);
@@ -1219,6 +1444,7 @@ function registerCli(api, engine, cliMethodInvoker) {
             ],
             {
               json: options.json,
+              transformRow: highlightSessionRow,
               emptyMessage: `No sessions were found for agent '${options.agent}'.`
             }
           );
@@ -1250,6 +1476,7 @@ function registerCli(api, engine, cliMethodInvoker) {
             ],
             {
               json: options.json,
+              transformRow: highlightCheckpointRow,
               emptyMessage: `No checkpoints were found for session '${options.session}'.`
             }
           );
@@ -1320,8 +1547,7 @@ function registerCli(api, engine, cliMethodInvoker) {
             prompt: options.prompt
           }, {
             preferGateway: true,
-            fallbackToLocal: false,
-            expectFinal: true
+            fallbackToLocal: false
           });
           printObject(result, options);
         });
@@ -1374,8 +1600,7 @@ function registerCli(api, engine, cliMethodInvoker) {
             prompt: options.prompt
           }, {
             preferGateway: true,
-            fallbackToLocal: false,
-            expectFinal: Boolean(options.continue)
+            fallbackToLocal: false
           });
           printObject(result, options);
         });
