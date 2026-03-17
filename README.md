@@ -165,6 +165,8 @@ const resumed = await plugin.methods["steprollback.continue"]({
   sessionId: "session-1",
   prompt: "Continue from here, but do not rewrite the config file yet."
 });
+
+console.log(resumed.branchId, resumed.newSessionId, resumed.newSessionKey);
 ```
 
 ## Configuration reference
@@ -322,6 +324,8 @@ openclaw gateway call steprollback.checkpoints.list --params '{"agentId":"main",
 openclaw gateway call steprollback.rollback.status --params '{"agentId":"main","sessionId":"<session-id>"}'
 ```
 
+`openclaw steprollback rollback`, `openclaw steprollback continue`, and `openclaw steprollback checkout` delegate through `openclaw gateway call ...` when the CLI process does not expose a direct Gateway caller, so keep Gateway running before you use those commands.
+
 ### 8. Use the rollback flow
 
 1. Start a normal OpenClaw task.
@@ -351,13 +355,22 @@ If this prints `No checkpoints were found`, check these first:
 3. `plugins.allow` includes `step-rollback`.
 4. The plugin was restarted after code changes.
 5. You are checking a fresh session that produced tool calls after the Git-backed checkpoint build was loaded.
+6. Gateway is still running if you are using terminal commands that mutate session state, such as `rollback`, `continue`, or `checkout`.
 
 When checkpoints are being created correctly, the plugin stores:
 
 - checkpoint manifests and runtime state under `~/.openclaw/plugins/step-rollback/checkpoints/`
 - Git snapshot repositories for each workspace root under `~/.openclaw/plugins/step-rollback/checkpoints/_git/`
 
-Recent builds also log the resolved plugin config and every `before_tool_call` checkpoint creation attempt. If you still see `/Users/you/...` in your OpenClaw config, the plugin now auto-rewrites that placeholder to your real home directory and emits a warning so it is visible in the terminal.
+Recent builds now log only the useful checkpoint debug signals:
+
+- receipt of the `before_tool_call` / `after_tool_call` hook
+- transcript-based resolution of `toolCallId -> entryId/nodeIndex`
+- Git snapshot repository initialization
+- current Git dirty-state summary before each checkpoint commit
+- checkpoint creation and reconciliation
+
+If you still see `/Users/you/...` in your OpenClaw config, the plugin rewrites that placeholder to your real home directory and emits a warning.
 
 6. Roll back to a checkpoint:
 
@@ -373,10 +386,23 @@ openclaw steprollback rollback-status --agent main --session <session-id>
 
 8. Continue execution.
 
+Important: `continue` no longer mutates the original session in place. It restores the checkpointed workspace, creates a new branched session, and starts a fresh Gateway `agent` run there. The command output includes `branchId`, `newSessionId`, and `newSessionKey`.
+
 Without a prompt:
 
 ```bash
 openclaw steprollback continue --agent main --session <session-id>
+```
+
+Typical result fields:
+
+```json
+{
+  "continued": true,
+  "branchId": "br_0001",
+  "newSessionId": "....",
+  "newSessionKey": "agent:main:direct:step-rollback-br_0001"
+}
 ```
 
 With a prompt:

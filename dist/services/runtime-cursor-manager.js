@@ -8,10 +8,15 @@ function createInitialState(agentId, sessionId, seed = {}) {
     sessionId,
     activeHeadEntryId: seed.activeHeadEntryId ?? null,
     currentRunId: seed.currentRunId ?? null,
+    toolCallSequence: seed.toolCallSequence ?? 0,
+    lastObservedToolCallId: seed.lastObservedToolCallId ?? null,
     rollbackInProgress: false,
     awaitingContinue: false,
     lastContinuePrompt: seed.lastContinuePrompt,
     lastRollbackCheckpointId: seed.lastRollbackCheckpointId,
+    lastContinueSessionId: seed.lastContinueSessionId ?? null,
+    lastContinueSessionKey: seed.lastContinueSessionKey ?? null,
+    lastContinuedBranchId: seed.lastContinuedBranchId ?? null,
     updatedAt: nowIso()
   };
 }
@@ -77,6 +82,32 @@ export class RuntimeCursorManager {
       state.currentRunId = runId ?? null;
       return state;
     });
+  }
+
+  async syncToolCallSequence(agentId, sessionId, value, toolCallId) {
+    return this.update(agentId, sessionId, (state) => {
+      const normalizedValue = Number.isInteger(value) && value > 0 ? value : state.toolCallSequence ?? 0;
+      state.toolCallSequence = Math.max(state.toolCallSequence ?? 0, normalizedValue);
+      if (toolCallId) {
+        state.lastObservedToolCallId = toolCallId;
+      }
+      return state;
+    });
+  }
+
+  async nextToolCallSequence(agentId, sessionId, toolCallId) {
+    let nextValue = 1;
+
+    await this.update(agentId, sessionId, (state) => {
+      nextValue = (state.toolCallSequence ?? 0) + 1;
+      state.toolCallSequence = nextValue;
+      if (toolCallId) {
+        state.lastObservedToolCallId = toolCallId;
+      }
+      return state;
+    });
+
+    return nextValue;
   }
 
   async setRollbackState(agentId, sessionId, inProgress) {

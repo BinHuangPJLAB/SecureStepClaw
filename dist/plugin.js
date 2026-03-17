@@ -163,7 +163,7 @@ export class StepRollbackPlugin {
 
     this.assertToolContext(ctx, "before_tool_call");
     this.logger.info(
-      `[${manifest.id}] before_tool_call agent='${ctx.agentId}' session='${ctx.sessionId}' entry='${ctx.entryId}' node='${ctx.nodeIndex}' tool='${ctx.toolName}'`
+      `[${manifest.id}] before_tool_call agent='${ctx.agentId}' session='${ctx.sessionId}' entry='${ctx.entryId}' node='${ctx.nodeIndex}' tool='${ctx.toolName}' toolCallId='${ctx.toolCallId ?? "-"}'`
     );
 
     await this.services.runtimeCursorManager.update(
@@ -194,10 +194,10 @@ export class StepRollbackPlugin {
 
     this.assertToolContext(ctx, "after_tool_call");
     this.logger.debug(
-      `[${manifest.id}] after_tool_call agent='${ctx.agentId}' session='${ctx.sessionId}' entry='${ctx.entryId}' node='${ctx.nodeIndex}' tool='${ctx.toolName}'`
+      `[${manifest.id}] after_tool_call agent='${ctx.agentId}' session='${ctx.sessionId}' entry='${ctx.entryId}' node='${ctx.nodeIndex}' tool='${ctx.toolName}' toolCallId='${ctx.toolCallId ?? "-"}'`
     );
 
-    return this.services.runtimeCursorManager.update(
+    const runtimeState = await this.services.runtimeCursorManager.update(
       ctx.agentId,
       ctx.sessionId,
       (state) => {
@@ -210,6 +210,12 @@ export class StepRollbackPlugin {
         currentRunId: ctx.runId ?? null
       }
     );
+
+    if (ctx.toolCallId) {
+      await this.services.checkpointManager.reconcile(ctx);
+    }
+
+    return runtimeState;
   }
 
   async listCheckpoints({ agentId, sessionId }) {
@@ -387,37 +393,103 @@ export class StepRollbackPlugin {
       `Session '${sessionId}' does not have an active checkpoint entry.`,
       { agentId, sessionId }
     );
+    ensureCondition(
+      state.lastRollbackCheckpointId,
+      "CHECKPOINT_NOT_FOUND",
+      `Session '${sessionId}' does not have a rollback checkpoint to continue from.`,
+      { agentId, sessionId }
+    );
+
+    const checkpoint = await this.services.checkpointManager.get(state.lastRollbackCheckpointId);
+
+    ensureCondition(
+      checkpoint,
+      "CHECKPOINT_NOT_FOUND",
+      `Checkpoint '${state.lastRollbackCheckpointId}' was not found.`,
+      { agentId, sessionId, checkpointId: state.lastRollbackCheckpointId }
+    );
+
+    await this.services.checkpointManager.restore(checkpoint.checkpointId, {
+      restoreWorkspace: true,
+      restoreRuntimeState: false
+    });
+
+    const branchId = await this.services.sequenceStore.next("br");
+    const createdSession = await this.host.createSession({
+      agentId,
+      sourceSessionId: sessionId,
+      sourceEntryId: state.activeHeadEntryId,
+      checkpointId: checkpoint.checkpointId,
+      branchId,
+      purpose: "continue"
+    });
+    const provisionalSessionId = createdSession?.sessionId ?? crypto.randomUUID();
+    const provisionalSessionKey = createdSession?.sessionKey ?? null;
 
     const runResult = await this.host.startContinueRun({
       agentId,
-      sessionId,
+      sessionId: provisionalSessionId,
+      sessionKey: provisionalSessionKey,
       entryId: state.activeHeadEntryId,
       prompt,
-      checkpointId: state.lastRollbackCheckpointId
+      checkpointId: checkpoint.checkpointId,
+      sourceSessionId: sessionId,
+      sourceEntryId: state.activeHeadEntryId,
+      branchId,
+      label: createdSession?.label
     });
     const started = runResult === undefined ? true : runResult === true || runResult.started !== false;
 
     ensureCondition(
       started,
       "CONTINUE_START_FAILED",
-      `Failed to continue session '${sessionId}'.`,
+      `Failed to continue session '${sessionId}' in a branched session.`,
       { agentId, sessionId }
     );
 
-    await this.services.runtimeCursorManager.applyContinue(agentId, sessionId, {
-      prompt,
-      runId: runResult?.runId ?? null
+    const newSessionId = runResult?.sessionId ?? provisionalSessionId;
+    const newSessionKey = runResult?.sessionKey ?? provisionalSessionKey ?? null;
+    const branchRecord = {
+      branchId,
+      sourceSessionId: sessionId,
+      sourceEntryId: state.activeHeadEntryId,
+      newSessionId,
+      newSessionKey,
+      createdAt: nowIso(),
+      reason: "continue"
+    };
+
+    await this.services.registry.saveBranch(branchRecord);
+    await this.services.runtimeCursorManager.replace(agentId, newSessionId, {
+      activeHeadEntryId: state.activeHeadEntryId,
+      currentRunId: runResult?.runId ?? null,
+      rollbackInProgress: false,
+      awaitingContinue: false,
+      lastRollbackCheckpointId: checkpoint.checkpointId
+    });
+    await this.services.runtimeCursorManager.update(agentId, sessionId, (currentState) => {
+      currentState.awaitingContinue = false;
+      currentState.rollbackInProgress = false;
+      currentState.lastContinuePrompt = prompt || undefined;
+      currentState.currentRunId = null;
+      currentState.lastContinuedBranchId = branchId;
+      currentState.lastContinueSessionId = newSessionId;
+      currentState.lastContinueSessionKey = newSessionKey ?? undefined;
+      return currentState;
     });
 
     this.logger.info(
-      `[${manifest.id}] continue started agent='${agentId}' session='${sessionId}' run='${runResult?.runId ?? "-"}'`
+      `[${manifest.id}] continue started from session='${sessionId}' into branch='${branchId}' newSession='${newSessionId}' run='${runResult?.runId ?? "-"}'`
     );
 
     return {
       agentId,
-      sessionId,
+      sourceSessionId: sessionId,
+      sourceEntryId: state.activeHeadEntryId,
+      branchId,
+      newSessionId,
+      newSessionKey,
       continued: true,
-      activeHeadEntryId: state.activeHeadEntryId,
       usedPrompt: Boolean(prompt)
     };
   }
@@ -461,65 +533,87 @@ export class StepRollbackPlugin {
         restoreRuntimeState: false
       });
 
+      const branchId = await this.services.sequenceStore.next("br");
       const createdSession = await this.host.createSession({
         agentId,
         sourceSessionId,
         sourceEntryId,
-        checkpointId: checkpoint.checkpointId
-      });
-
-      const newSessionId = createdSession?.sessionId ?? crypto.randomUUID();
-      const branchId = await this.services.sequenceStore.next("br");
-      const branchRecord = {
+        checkpointId: checkpoint.checkpointId,
         branchId,
-        sourceSessionId,
-        sourceEntryId,
-        newSessionId,
-        createdAt: nowIso()
-      };
-
-      await this.services.runtimeCursorManager.replace(agentId, newSessionId, {
-        activeHeadEntryId: sourceEntryId,
-        currentRunId: null,
-        rollbackInProgress: false,
-        awaitingContinue: false,
-        lastRollbackCheckpointId: checkpoint.checkpointId
+        purpose: "checkout"
       });
-      await this.services.registry.saveBranch(branchRecord);
+
+      const provisionalSessionId = createdSession?.sessionId ?? crypto.randomUUID();
+      const provisionalSessionKey = createdSession?.sessionKey ?? null;
 
       let continued = false;
       let usedPrompt = false;
+      let resolvedSessionId = provisionalSessionId;
+      let resolvedSessionKey = provisionalSessionKey;
 
       if (continueAfterCheckout) {
         const runResult = await this.host.startContinueRun({
           agentId,
-          sessionId: newSessionId,
+          sessionId: provisionalSessionId,
+          sessionKey: provisionalSessionKey,
           entryId: sourceEntryId,
           prompt,
-          checkpointId: checkpoint.checkpointId
+          checkpointId: checkpoint.checkpointId,
+          sourceSessionId,
+          sourceEntryId,
+          branchId,
+          label: createdSession?.label
         });
         const started = runResult === undefined ? true : runResult === true || runResult.started !== false;
 
         ensureCondition(
           started,
           "CONTINUE_START_FAILED",
-          `Failed to continue newly checked out session '${newSessionId}'.`,
-          { agentId, sourceSessionId, newSessionId, sourceEntryId }
+          `Failed to continue newly checked out session '${provisionalSessionId}'.`,
+          { agentId, sourceSessionId, newSessionId: provisionalSessionId, sourceEntryId }
         );
 
-        await this.services.runtimeCursorManager.applyContinue(agentId, newSessionId, {
+        resolvedSessionId = runResult?.sessionId ?? provisionalSessionId;
+        resolvedSessionKey = runResult?.sessionKey ?? provisionalSessionKey ?? null;
+        await this.services.runtimeCursorManager.replace(agentId, resolvedSessionId, {
+          activeHeadEntryId: sourceEntryId,
+          currentRunId: runResult?.runId ?? null,
+          rollbackInProgress: false,
+          awaitingContinue: false,
+          lastRollbackCheckpointId: checkpoint.checkpointId
+        });
+        await this.services.runtimeCursorManager.applyContinue(agentId, resolvedSessionId, {
           prompt,
           runId: runResult?.runId ?? null
         });
         continued = true;
         usedPrompt = Boolean(prompt);
+      } else {
+        await this.services.runtimeCursorManager.replace(agentId, resolvedSessionId, {
+          activeHeadEntryId: sourceEntryId,
+          currentRunId: null,
+          rollbackInProgress: false,
+          awaitingContinue: false,
+          lastRollbackCheckpointId: checkpoint.checkpointId
+        });
       }
+
+      const branchRecord = {
+        branchId,
+        sourceSessionId,
+        sourceEntryId,
+        newSessionId: resolvedSessionId,
+        newSessionKey: resolvedSessionKey,
+        createdAt: nowIso()
+      };
+      await this.services.registry.saveBranch(branchRecord);
 
       return {
         branchId,
         sourceSessionId,
         sourceEntryId,
-        newSessionId,
+        newSessionId: resolvedSessionId,
+        newSessionKey: resolvedSessionKey,
         continued,
         usedPrompt
       };

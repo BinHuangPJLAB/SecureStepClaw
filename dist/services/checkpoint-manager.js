@@ -38,7 +38,7 @@ export class CheckpointManager {
     const snapshotRoot = path.join(this.config.checkpointDir, checkpointId);
     const createdAt = nowIso();
     this.logger.info(
-      `[step-rollback] checkpoint create start checkpoint='${checkpointId}' session='${ctx.sessionId}' tool='${ctx.toolName}'`
+      `[step-rollback] checkpoint create start checkpoint='${checkpointId}' session='${ctx.sessionId}' tool='${ctx.toolName}' toolCallId='${ctx.toolCallId ?? "-"}'`
     );
 
     const runtimeState = await this.runtimeCursorManager.ensure(ctx.agentId, ctx.sessionId, {
@@ -69,6 +69,7 @@ export class CheckpointManager {
       checkpointId,
       agentId: ctx.agentId,
       sessionId: ctx.sessionId,
+      toolCallId: ctx.toolCallId ?? null,
       entryId: ctx.entryId,
       nodeIndex: ctx.nodeIndex,
       toolName: ctx.toolName,
@@ -112,6 +113,39 @@ export class CheckpointManager {
 
   async list(agentId, sessionId) {
     return this.registry.list(agentId, sessionId);
+  }
+
+  async reconcile(ctx) {
+    if (!ctx?.agentId || !ctx?.sessionId || !ctx?.toolCallId) {
+      return null;
+    }
+
+    const checkpoints = await this.registry.list(ctx.agentId, ctx.sessionId);
+    const candidate = [...checkpoints]
+      .reverse()
+      .find((checkpoint) => checkpoint.toolCallId === ctx.toolCallId);
+
+    if (!candidate) {
+      this.logger.warn(
+        `[step-rollback] reconcile skipped because no checkpoint matched toolCallId='${ctx.toolCallId}' session='${ctx.sessionId}'`
+      );
+      return null;
+    }
+
+    if (candidate.entryId === ctx.entryId && candidate.nodeIndex === ctx.nodeIndex) {
+      return candidate;
+    }
+
+    this.logger.info(
+      `[step-rollback] reconciling checkpoint '${candidate.checkpointId}' to entry='${ctx.entryId}' node='${ctx.nodeIndex}' toolCallId='${ctx.toolCallId}'`
+    );
+
+    return this.registry.update(candidate.checkpointId, (current) => {
+      current.entryId = ctx.entryId;
+      current.nodeIndex = ctx.nodeIndex;
+      current.toolCallId = ctx.toolCallId ?? current.toolCallId ?? null;
+      return current;
+    });
   }
 
   async restore(checkpointId, options = {}) {
@@ -258,6 +292,11 @@ export class CheckpointManager {
   async captureGitSnapshot(repoDir, rootPath, checkpointId, toolName) {
     await this.ensureGitRepository(repoDir);
 
+    const statusBeforeCommit = await this.describeGitWorkspace(repoDir, rootPath);
+    this.logger.info(
+      `[step-rollback] git workspace status checkpoint='${checkpointId}' root='${rootPath}' dirtyCount='${statusBeforeCommit.dirtyCount}' sample='${statusBeforeCommit.sample.join(" | ") || "-"}'`
+    );
+
     await this.runGit(
       [
         "--git-dir",
@@ -349,6 +388,23 @@ export class CheckpointManager {
     await this.runGit(["init", "--bare", repoDir], {
       cwd: path.dirname(repoDir)
     });
+  }
+
+  async describeGitWorkspace(repoDir, rootPath) {
+    const { stdout } = await this.runGit(
+      ["--git-dir", repoDir, "--work-tree", rootPath, "status", "--short", "--untracked-files=all"],
+      { cwd: rootPath }
+    );
+
+    const lines = stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    return {
+      dirtyCount: lines.length,
+      sample: lines.slice(0, 5)
+    };
   }
 
   async runGit(args, options = {}) {

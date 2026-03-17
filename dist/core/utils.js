@@ -65,9 +65,18 @@ export function repairPlaceholderHomePath(value) {
   return path.join(os.homedir(), value.slice("/home/you/".length));
 }
 
-export function resolveAbsolutePath(value, cwd = process.cwd()) {
+export function safeProcessCwd(fallback = os.homedir()) {
+  try {
+    return process.cwd();
+  } catch {
+    return fallback;
+  }
+}
+
+export function resolveAbsolutePath(value, cwd) {
   const expanded = expandHomePath(repairPlaceholderHomePath(value));
-  return path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(cwd, expanded);
+  const baseDir = typeof cwd === "string" && cwd ? cwd : safeProcessCwd();
+  return path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(baseDir, expanded);
 }
 
 export function resolveConfig(config = {}) {

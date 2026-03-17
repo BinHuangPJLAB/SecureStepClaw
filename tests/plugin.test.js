@@ -8,6 +8,7 @@ import nativeStepRollbackPlugin, {
   createNativeStepRollbackPlugin,
   createStepRollbackPlugin
 } from "../dist/index.js";
+import { resolveAbsolutePath } from "../dist/core/utils.js";
 
 async function createFixture() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "secure-step-claw-"));
@@ -23,6 +24,23 @@ async function createFixture() {
     registryDir: path.join(pluginRoot, "registry"),
     runtimeDir: path.join(pluginRoot, "runtime"),
     reportsDir: path.join(pluginRoot, "reports")
+  };
+}
+
+async function writeSessionTranscript(root, agentId, sessionId, entries) {
+  const sessionsDir = path.join(root, "agents", agentId, "sessions");
+  const transcriptPath = path.join(sessionsDir, `${sessionId}.jsonl`);
+
+  await fs.mkdir(sessionsDir, { recursive: true });
+  await fs.writeFile(
+    transcriptPath,
+    `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+    "utf8"
+  );
+
+  return {
+    transcriptPath,
+    sessionStoreTemplate: path.join(root, "agents", "{agentId}", "sessions", "sessions.json")
   };
 }
 
@@ -86,6 +104,7 @@ test("creates checkpoints, rolls back workspace state, and continues from the ch
   const fixture = await createFixture();
   const calls = {
     stopRun: [],
+    createSession: [],
     continueRun: []
   };
 
@@ -102,9 +121,20 @@ test("creates checkpoints, rolls back workspace state, and continues from the ch
         calls.stopRun.push(input);
         return { stopped: true };
       },
+      async createSession(input) {
+        calls.createSession.push(input);
+        return {
+          sessionId: "session-branch-1",
+          sessionKey: "agent:main:direct:step-rollback-br_0001"
+        };
+      },
       async startContinueRun(input) {
         calls.continueRun.push(input);
-        return { runId: `continued:${input.sessionId}:${input.entryId}` };
+        return {
+          runId: `continued:${input.sessionId}:${input.entryId}`,
+          sessionId: input.sessionId,
+          sessionKey: input.sessionKey
+        };
       }
     }
   });
@@ -178,8 +208,13 @@ test("creates checkpoints, rolls back workspace state, and continues from the ch
 
   assert.equal(continueResponse.continued, true);
   assert.equal(continueResponse.usedPrompt, true);
+  assert.equal(continueResponse.newSessionId, "session-branch-1");
+  assert.equal(continueResponse.newSessionKey, "agent:main:direct:step-rollback-br_0001");
+  assert.equal(calls.createSession.length, 1);
   assert.equal(calls.continueRun.length, 1);
   assert.equal(calls.continueRun[0].entryId, "entry-1");
+  assert.equal(calls.continueRun[0].sessionId, "session-branch-1");
+  assert.equal(calls.continueRun[0].sessionKey, "agent:main:direct:step-rollback-br_0001");
 
   const report = await plugin.methods["steprollback.reports.get"]({
     rollbackId: rollbackResponse.rollbackId
@@ -190,7 +225,40 @@ test("creates checkpoints, rolls back workspace state, and continues from the ch
 
   const finalState = await plugin.services.runtimeCursorManager.get("main", "session-1");
   assert.equal(finalState.awaitingContinue, false);
-  assert.equal(finalState.currentRunId, "continued:session-1:entry-1");
+  assert.equal(finalState.currentRunId, null);
+  assert.equal(finalState.lastContinueSessionId, "session-branch-1");
+
+  const branchedState = await plugin.services.runtimeCursorManager.get("main", "session-branch-1");
+  assert.equal(branchedState.currentRunId, "continued:session-branch-1:entry-1");
+
+  const branch = await plugin.methods["steprollback.session.branch.get"]({
+    branchId: continueResponse.branchId
+  });
+  assert.equal(branch.sourceSessionId, "session-1");
+  assert.equal(branch.newSessionId, "session-branch-1");
+});
+
+test("resolves relative paths even when process cwd is unavailable", () => {
+  const originalCwd = process.cwd;
+
+  Object.defineProperty(process, "cwd", {
+    value() {
+      const error = new Error("missing cwd");
+      error.code = "ENOENT";
+      throw error;
+    },
+    configurable: true
+  });
+
+  try {
+    const resolved = resolveAbsolutePath("relative/path");
+    assert.equal(resolved, path.join(os.homedir(), "relative/path"));
+  } finally {
+    Object.defineProperty(process, "cwd", {
+      value: originalCwd,
+      configurable: true
+    });
+  }
 });
 
 test("repairs placeholder home paths in plugin config", async () => {
@@ -354,11 +422,49 @@ test("registers a native OpenClaw plugin and drives rollback through registered 
   };
   const gatewayCalls = [];
   const logs = [];
+  const toolCallId = "chatcmpl-tool-native";
+  const transcript = await writeSessionTranscript(fixture.root, "main", "native-session", [
+    {
+      type: "message",
+      id: "entry-native",
+      timestamp: "2026-03-17T00:00:00.000Z",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: toolCallId,
+            name: "write",
+            arguments: {
+              file_path: path.join(fixture.workspace, "native.txt"),
+              content: "broken\n"
+            }
+          }
+        ]
+      }
+    }
+  ]);
+  const nativeSessionStorePath = transcript.sessionStoreTemplate.replace("{agentId}", "main");
+
+  await fs.writeFile(
+    nativeSessionStorePath,
+    `${JSON.stringify({
+      "agent:main:main": {
+        sessionId: "native-session",
+        label: "Native test session",
+        updatedAt: "2026-03-17T00:00:00.000Z"
+      }
+    }, null, 2)}\n`,
+    "utf8"
+  );
 
   await fs.writeFile(path.join(fixture.workspace, "native.txt"), "safe\n", "utf8");
 
   const api = {
     config: {
+      session: {
+        storePath: transcript.sessionStoreTemplate
+      },
       plugins: {
         entries: {
           "step-rollback": {
@@ -413,8 +519,19 @@ test("registers a native OpenClaw plugin and drives rollback through registered 
           }
 
           if (method === "agent") {
+            const currentStore = JSON.parse(await fs.readFile(nativeSessionStorePath, "utf8"));
+
+            if (params.sessionKey && !currentStore[params.sessionKey]) {
+              currentStore[params.sessionKey] = {
+                sessionId: "native-session-branch",
+                label: params.label ?? "Rollback branch",
+                updatedAt: "2026-03-17T00:00:01.000Z"
+              };
+              await fs.writeFile(nativeSessionStorePath, `${JSON.stringify(currentStore, null, 2)}\n`, "utf8");
+            }
+
             return {
-              runId: `run:${params.sessionId}:${params.resumeFromEntryId ?? "tail"}`,
+              runId: `run:${params.sessionKey ?? params.sessionId}:tail`,
               acceptedAt: "2026-03-17T00:00:01.000Z"
             };
           }
@@ -451,9 +568,8 @@ test("registers a native OpenClaw plugin and drives rollback through registered 
   await registered.hooks.get("before_tool_call").handler({
     agentId: "main",
     sessionId: "native-session",
-    entryId: "entry-native",
-    nodeIndex: 1,
     toolName: "write",
+    toolCallId,
     runId: "run-native"
   });
 
@@ -499,16 +615,22 @@ test("registers a native OpenClaw plugin and drives rollback through registered 
   });
 
   assert.equal(continueResponse.continued, true);
+  assert.equal(continueResponse.newSessionId, "native-session-branch");
+  assert.match(continueResponse.newSessionKey, /^agent:main:direct:step-rollback-br_0001$/);
   assert.equal(
     gatewayCalls.some(
       (call) =>
         call.method === "agent" &&
-        call.params.sessionId === "native-session" &&
+        call.params.sessionKey === continueResponse.newSessionKey &&
+        !("resumeFromEntryId" in call.params) &&
         call.params.message === "Continue from the restored checkpoint."
     ),
     true
   );
   assert.equal(logs.some((entry) => entry.message.includes("registered native OpenClaw plugin surfaces")), true);
+  assert.equal(logs.some((entry) => entry.message.includes("resolved config")), false);
+  assert.equal(logs.some((entry) => entry.message.includes("resolved tool checkpoint context")), true);
+  assert.equal(logs.some((entry) => entry.message.includes("git workspace status")), true);
 });
 
 test("returns Gateway-style error payloads for native RPC handlers", async () => {
@@ -573,8 +695,10 @@ test("offers flag-based CLI commands for agents, sessions, rollback, and continu
     services: [],
     clis: []
   };
+  const cliGatewayCalls = [];
   const sessionStoreTemplate = path.join(fixture.root, "agents", "{agentId}", "sessions", "sessions.json");
   const sessionStorePath = sessionStoreTemplate.replace("{agentId}", "main");
+  const toolCallId = "chatcmpl-tool-cli";
 
   await fs.mkdir(path.dirname(sessionStorePath), { recursive: true });
   await fs.writeFile(
@@ -588,6 +712,27 @@ test("offers flag-based CLI commands for agents, sessions, rollback, and continu
     ], null, 2)}\n`,
     "utf8"
   );
+  await writeSessionTranscript(fixture.root, "main", "session-cli", [
+    {
+      type: "message",
+      id: "entry-cli",
+      timestamp: "2026-03-17T12:00:00.000Z",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: toolCallId,
+            name: "write",
+            arguments: {
+              file_path: path.join(fixture.workspace, "cli.txt"),
+              content: "broken\n"
+            }
+          }
+        ]
+      }
+    }
+  ]);
   await fs.writeFile(path.join(fixture.workspace, "cli.txt"), "stable\n", "utf8");
 
   const api = {
@@ -639,25 +784,27 @@ test("offers flag-based CLI commands for agents, sessions, rollback, and continu
     },
     registerCli(factory, meta) {
       registered.clis.push({ factory, meta });
-    },
-    runtime: {
-      gateway: {
-        async call(method, params) {
-          if (method === "agent" && params.message === "/stop") {
-            return { runId: "stop-cli" };
-          }
-
-          if (method === "agent") {
-            return { runId: `run:${params.sessionId}:${params.resumeFromEntryId ?? "tail"}` };
-          }
-
-          return undefined;
-        }
-      }
     }
   };
 
-  await createNativeStepRollbackPlugin().register(api);
+  await createNativeStepRollbackPlugin({
+    host: {
+      async stopRun() {
+        return { stopped: true, runId: "stop-cli" };
+      },
+      async startContinueRun({ sessionId, entryId }) {
+        return { started: true, runId: `run:${sessionId}:${entryId}` };
+      },
+      async createSession() {
+        return { sessionId: "session-checkout-cli" };
+      }
+    },
+    cliGatewayInvoker: async (methodName, params) => {
+      cliGatewayCalls.push({ methodName, params });
+      const handler = registered.methods.get(methodName);
+      return handler ? handler({ params }) : undefined;
+    }
+  }).register(api);
 
   const cliHarness = createFakeProgram();
   registered.clis[0].factory({ program: cliHarness.program });
@@ -670,9 +817,8 @@ test("offers flag-based CLI commands for agents, sessions, rollback, and continu
   await registered.hooks.get("before_tool_call").handler({
     agentId: "main",
     sessionId: "session-cli",
-    entryId: "entry-cli",
-    nodeIndex: 1,
     toolName: "write",
+    toolCallId,
     runId: "run-cli"
   });
   await fs.writeFile(path.join(fixture.workspace, "cli.txt"), "broken\n", "utf8");
@@ -728,4 +874,14 @@ test("offers flag-based CLI commands for agents, sessions, rollback, and continu
   });
   assert.match(continueOutput, /continued/);
   assert.match(continueOutput, /usedPrompt/);
+  assert.equal(
+    cliGatewayCalls.some(
+      (call) =>
+        call.methodName === "steprollback.continue" &&
+        call.params.agentId === "main" &&
+        call.params.sessionId === "session-cli" &&
+        call.params.prompt === "Inspect first."
+    ),
+    true
+  );
 });

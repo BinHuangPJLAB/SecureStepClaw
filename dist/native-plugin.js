@@ -1,4 +1,8 @@
+import { execFile } from "node:child_process";
 import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { promisify } from "node:util";
 
 import { StepRollbackError, toStepRollbackError } from "./core/errors.js";
 import {
@@ -30,8 +34,10 @@ const GATEWAY_METHOD_NAMES = [
   "steprollback.session.branch.get"
 ];
 
+const execFileAsync = promisify(execFile);
+
 function createLogger(api) {
-  const noop = () => {};
+  const noop = () => { };
   const logger = api?.logger ?? {};
 
   return {
@@ -154,6 +160,39 @@ function unwrapRpcResult(result) {
   return result;
 }
 
+function extractJsonPayload(output) {
+  const trimmed = typeof output === "string" ? output.trim() : "";
+
+  if (!trimmed) {
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const lines = trimmed
+      .split("\n")
+      .map((line) => line.trimEnd())
+      .filter(Boolean);
+
+    for (let start = 0; start < lines.length; start += 1) {
+      const candidate = lines.slice(start).join("\n");
+
+      try {
+        return JSON.parse(candidate);
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  throw new StepRollbackError(
+    "GATEWAY_CALL_FAILED",
+    "OpenClaw gateway call did not return valid JSON output.",
+    { output: trimmed }
+  );
+}
+
 function resolvePluginConfig(api, pluginId) {
   const entryConfig = api?.config?.plugins?.entries?.[pluginId]?.config;
   const directConfig = api?.pluginConfig;
@@ -207,8 +246,6 @@ function prepareResolvedConfig(rawConfig, logger) {
     );
   }
 
-  logger.info?.(`[${manifest.id}] resolved config\n${formatConfigSummary(resolvedConfig)}`);
-
   for (const rootPath of resolvedConfig.workspaceRoots) {
     if (!fileExistsSync(rootPath)) {
       logger.warn?.(`[${manifest.id}] configured workspace root does not exist: ${rootPath}`);
@@ -216,6 +253,171 @@ function prepareResolvedConfig(rawConfig, logger) {
   }
 
   return resolvedConfig;
+}
+
+function resolveSessionTranscriptPath(api, agentId, sessionId) {
+  const configuredPath = pickFirst(
+    api?.config?.session?.storePath,
+    api?.config?.session?.indexPath,
+    api?.config?.sessions?.storePath,
+    api?.config?.sessions?.indexPath
+  );
+
+  if (typeof configuredPath === "string") {
+    const resolvedPath = resolveAbsolutePath(
+      configuredPath
+        .replaceAll("{agentId}", agentId)
+        .replaceAll("{agent}", agentId)
+        .replaceAll("{sessionId}", sessionId)
+    );
+
+    if (resolvedPath.endsWith(".jsonl")) {
+      return resolvedPath;
+    }
+
+    return path.join(path.dirname(resolvedPath), `${sessionId}.jsonl`);
+  }
+
+  return resolveAbsolutePath(`~/.openclaw/agents/${agentId}/sessions/${sessionId}.jsonl`);
+}
+
+function extractToolCallsFromAssistantEntry(entry) {
+  const content = Array.isArray(entry?.message?.content) ? entry.message.content : [];
+  const toolCalls = [];
+
+  for (const item of content) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+
+    const type = typeof item.type === "string" ? item.type.toLowerCase() : "";
+    const toolCallId = pickFirst(item.id, item.toolCallId, item.tool_call_id);
+    const toolName = pickFirst(item.name, item.toolName, item.tool_name);
+
+    if (
+      ["toolcall", "tool_call", "tooluse", "tool_use"].includes(type) ||
+      (toolCallId && toolName && item.arguments !== undefined)
+    ) {
+      toolCalls.push({
+        toolCallId,
+        toolName
+      });
+    }
+  }
+
+  return toolCalls;
+}
+
+async function resolveToolCallEntryFromTranscript(api, normalized, logger) {
+  if (!normalized.agentId || !normalized.sessionId || !normalized.toolCallId) {
+    return null;
+  }
+
+  const transcriptPath = resolveSessionTranscriptPath(api, normalized.agentId, normalized.sessionId);
+
+  let contents;
+
+  try {
+    contents = await fs.readFile(transcriptPath, "utf8");
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      logger.warn?.(
+        `[${manifest.id}] hook '${normalized.hookName}' could not inspect transcript because it does not exist yet: ${transcriptPath}`
+      );
+      return null;
+    }
+
+    throw error;
+  }
+
+  const lines = contents
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  let nodeIndex = 0;
+
+  for (const line of lines) {
+    let entry;
+
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    if (entry?.type !== "message" || entry?.message?.role !== "assistant") {
+      continue;
+    }
+
+    for (const toolCall of extractToolCallsFromAssistantEntry(entry)) {
+      nodeIndex += 1;
+
+      if (toolCall.toolCallId === normalized.toolCallId) {
+        return {
+          entryId: pickFirst(entry.id, normalized.toolCallId),
+          nodeIndex,
+          transcriptPath
+        };
+      }
+    }
+  }
+
+  logger.warn?.(
+    `[${manifest.id}] hook '${normalized.hookName}' did not find toolCallId='${normalized.toolCallId}' in transcript '${transcriptPath}' yet`
+  );
+
+  return null;
+}
+
+async function resolveToolHookContext(api, engine, normalized, logger) {
+  const enriched = { ...normalized };
+  const runtimeCursorManager = engine?.services?.runtimeCursorManager;
+
+  if (!enriched.toolName) {
+    return enriched;
+  }
+
+  if ((!enriched.entryId || !Number.isInteger(enriched.nodeIndex)) && enriched.toolCallId) {
+    const transcriptMatch = await resolveToolCallEntryFromTranscript(api, enriched, logger);
+
+    if (transcriptMatch) {
+      enriched.entryId = enriched.entryId ?? transcriptMatch.entryId;
+      enriched.nodeIndex = Number.isInteger(enriched.nodeIndex) ? enriched.nodeIndex : transcriptMatch.nodeIndex;
+      logger.info?.(
+        `[${manifest.id}] resolved tool checkpoint context from transcript toolCallId='${enriched.toolCallId}' entry='${enriched.entryId}' node='${enriched.nodeIndex}'`
+      );
+    }
+  }
+
+  if (runtimeCursorManager) {
+    if (Number.isInteger(enriched.nodeIndex)) {
+      await runtimeCursorManager.syncToolCallSequence(
+        enriched.agentId,
+        enriched.sessionId,
+        enriched.nodeIndex,
+        enriched.toolCallId
+      );
+    } else {
+      enriched.nodeIndex = await runtimeCursorManager.nextToolCallSequence(
+        enriched.agentId,
+        enriched.sessionId,
+        enriched.toolCallId
+      );
+      logger.warn?.(
+        `[${manifest.id}] fallback tool checkpoint sequence was used for tool='${enriched.toolName}' toolCallId='${enriched.toolCallId ?? "-"}' node='${enriched.nodeIndex}'`
+      );
+    }
+  }
+
+  if (!enriched.entryId) {
+    enriched.entryId = enriched.toolCallId ? `toolcall:${enriched.toolCallId}` : `toolcall:${enriched.nodeIndex ?? "unknown"}`;
+    logger.warn?.(
+      `[${manifest.id}] fallback checkpoint entry id was used for tool='${enriched.toolName}' toolCallId='${enriched.toolCallId ?? "-"}' entry='${enriched.entryId}'`
+    );
+  }
+
+  return enriched;
 }
 
 function extractGatewayParams(request) {
@@ -255,6 +457,14 @@ function normalizeHookContext(kind, event, ctx) {
       ctx?.runId,
       ctx?.run?.id
     ),
+    toolCallId: pickFirst(
+      event?.toolCallId,
+      event?.tool_call_id,
+      event?.toolCall?.id,
+      ctx?.toolCallId,
+      ctx?.tool_call_id,
+      ctx?.toolCall?.id
+    ),
     entryId: pickFirst(
       event?.entryId,
       event?.entry?.id,
@@ -284,7 +494,8 @@ function normalizeHookContext(kind, event, ctx) {
       event?.session?.cwd,
       ctx?.cwd,
       ctx?.session?.cwd
-    )
+    ),
+    params: pickFirst(event?.params, event?.input, ctx?.params, ctx?.input)
   };
 
   if (kind === "session") {
@@ -327,6 +538,32 @@ function normalizeRecordArray(value) {
 
   if (value && typeof value === "object") {
     return Object.values(value);
+  }
+
+  return [];
+}
+
+function normalizeSessionStoreRecords(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => {
+        if (!entry || typeof entry !== "object") {
+          return null;
+        }
+
+        return {
+          ...entry,
+          sessionKey: pickFirst(entry.sessionKey, entry.key)
+        };
+      })
+      .filter(Boolean);
+  }
+
+  if (value && typeof value === "object") {
+    return Object.entries(value).map(([key, entry]) => ({
+      ...(entry && typeof entry === "object" ? entry : {}),
+      sessionKey: pickFirst(entry?.sessionKey, entry?.key, key)
+    }));
   }
 
   return [];
@@ -454,9 +691,10 @@ async function listSessionsForAgent(api, agentId) {
   const sessionIndexPath = resolveSessionIndexPath(api, agentId);
   const contents = await readJson(sessionIndexPath, []);
 
-  const sessions = normalizeRecordArray(contents)
+  const sessions = normalizeSessionStoreRecords(contents)
     .map((entry) => ({
       sessionId: pickFirst(entry?.sessionId, entry?.id),
+      sessionKey: pickFirst(entry?.sessionKey, entry?.key),
       title: pickFirst(entry?.title, entry?.summary, entry?.label) || "(untitled)",
       createdAtRaw: pickFirst(entry?.createdAt, entry?.startedAt),
       updatedAtRaw: pickFirst(entry?.updatedAt, entry?.lastUpdatedAt, entry?.lastActivityAt),
@@ -470,6 +708,7 @@ async function listSessionsForAgent(api, agentId) {
     )
     .map((entry, index) => ({
       sessionId: entry.sessionId,
+      sessionKey: entry.sessionKey,
       marker: index === 0 ? "latest" : "",
       title: entry.title,
       updatedAt: formatTimestamp(entry.updatedAtRaw),
@@ -478,6 +717,43 @@ async function listSessionsForAgent(api, agentId) {
     }));
 
   return sessions;
+}
+
+async function resolveSessionRecord(api, agentId, reference = {}) {
+  const sessions = await listSessionsForAgent(api, agentId);
+  const sessionId = typeof reference.sessionId === "string" ? reference.sessionId.trim() : "";
+  const sessionKey = typeof reference.sessionKey === "string" ? reference.sessionKey.trim() : "";
+
+  if (!sessionId && !sessionKey) {
+    return null;
+  }
+
+  return sessions.find((entry) => {
+    if (sessionKey && entry.sessionKey === sessionKey) {
+      return true;
+    }
+
+    return sessionId ? entry.sessionId === sessionId : false;
+  }) ?? null;
+}
+
+function sanitizeSessionToken(value, fallback = "branch") {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return normalized || fallback;
+}
+
+function buildBranchSessionKey(agentId, branchId) {
+  return `agent:${sanitizeSessionToken(agentId, "main")}:direct:step-rollback-${sanitizeSessionToken(branchId, "branch")}`;
+}
+
+function buildBranchSessionLabel(sourceSessionId, branchId) {
+  const compactSource = sanitizeSessionToken(sourceSessionId, "source").slice(0, 12);
+  return `Rollback ${compactSource} ${branchId}`;
 }
 
 function formatValue(value) {
@@ -542,8 +818,105 @@ function printObject(value, options = {}) {
   ]));
 }
 
+async function invokeGatewayViaCli(methodName, params, options = {}) {
+  const command = options.gatewayCommand ?? process.env.OPENCLAW_BIN ?? "openclaw";
+  const cwd = resolveAbsolutePath("~", options.cliCwd);
+  const args = [
+    "gateway",
+    "call",
+    methodName,
+    "--json",
+    "--params",
+    JSON.stringify(params ?? {})
+  ];
+
+  if (options.expectFinal) {
+    args.push("--expect-final");
+  }
+
+  try {
+    const result = await execFileAsync(command, args, {
+      cwd,
+      env: process.env,
+      maxBuffer: 10 * 1024 * 1024
+    });
+    return unwrapRpcResult(extractJsonPayload(result.stdout));
+  } catch (error) {
+    const stderr = typeof error?.stderr === "string" ? error.stderr.trim() : "";
+    const stdout = typeof error?.stdout === "string" ? error.stdout.trim() : "";
+    const message = stderr || stdout || (error instanceof Error ? error.message : String(error));
+
+    throw new StepRollbackError(
+      "GATEWAY_CALL_FAILED",
+      `Failed to call Gateway method '${methodName}' from the CLI. ${message}`,
+      { methodName, params }
+    );
+  }
+}
+
 function optionalBoolean(value) {
   return value === undefined ? undefined : Boolean(value);
+}
+
+function createCliMethodInvoker(api, engine, logger, options = {}) {
+  const externalGatewayInvoker = typeof options.cliGatewayInvoker === "function"
+    ? options.cliGatewayInvoker
+    : null;
+
+  return async (methodName, params, behavior = {}) => {
+    const {
+      preferGateway = true,
+      fallbackToLocal = false,
+      expectFinal = false
+    } = behavior;
+
+    if (preferGateway) {
+      const rpcResult = await callGatewayMethod(api, methodName, params);
+
+      if (rpcResult !== undefined) {
+        logger.debug?.(`[${manifest.id}] CLI delegated '${methodName}' through an exposed Gateway caller`);
+        return unwrapRpcResult(rpcResult);
+      }
+
+      if (externalGatewayInvoker) {
+        logger.debug?.(`[${manifest.id}] CLI delegated '${methodName}' through the configured Gateway invoker`);
+        return await externalGatewayInvoker(methodName, params, { expectFinal });
+      }
+
+      try {
+        logger.debug?.(`[${manifest.id}] CLI delegated '${methodName}' through 'openclaw gateway call'`);
+        return await invokeGatewayViaCli(methodName, params, {
+          expectFinal,
+          gatewayCommand: options.gatewayCommand,
+          cliCwd: options.cliCwd
+        });
+      } catch (error) {
+        if (!fallbackToLocal) {
+          throw new StepRollbackError(
+            "GATEWAY_CALL_FAILED",
+            `Command '${methodName}' requires a live OpenClaw Gateway connection. Restart Gateway and try again. ${toStepRollbackError(error).message}`,
+            { methodName, params }
+          );
+        }
+
+        logger.warn?.(
+          `[${manifest.id}] CLI Gateway delegation for '${methodName}' failed, falling back to local engine: ${toStepRollbackError(error).message}`
+        );
+      }
+    }
+
+    const localMethod = engine?.methods?.[methodName];
+
+    if (typeof localMethod !== "function") {
+      throw new StepRollbackError(
+        "GATEWAY_CALL_FAILED",
+        `Step Rollback could not resolve a handler for '${methodName}'.`,
+        { methodName, params }
+      );
+    }
+
+    return localMethod(params);
+  };
 }
 
 function createNativeHostBridge(api, logger) {
@@ -590,47 +963,71 @@ function createNativeHostBridge(api, logger) {
       };
     },
 
-    async startContinueRun({ agentId, sessionId, entryId, prompt }) {
-      const directResult = await callFirstHelper(api, [
-        ["runtime", "agent", "continueRun"],
-        ["runtime", "agent", "startContinueRun"],
-        ["runtime", "agent", "startRun"],
-        ["runtime", "runs", "start"],
-        ["runtime", "runControl", "startContinueRun"]
-      ], {
-        agentId,
+    async startContinueRun({ agentId, sessionId, sessionKey, entryId, prompt, sourceSessionId, branchId, label }) {
+      const knownSession = await resolveSessionRecord(api, agentId, {
         sessionId,
-        entryId,
-        prompt
+        sessionKey
       });
-
-      if (directResult !== undefined) {
-        return directResult;
-      }
-
+      const targetSessionKey = sessionKey ?? knownSession?.sessionKey;
+      const targetSessionId = sessionId ?? knownSession?.sessionId;
       const syntheticMessage = prompt?.trim() || "Continue from the restored checkpoint.";
+      const branchLabel = label ?? buildBranchSessionLabel(sourceSessionId ?? targetSessionId ?? "session", branchId ?? "continue");
       const rpcResult = await callGatewayMethod(api, "agent", {
         agentId,
-        sessionId,
-        sessionIdOverride: sessionId,
+        ...(targetSessionKey ? { sessionKey: targetSessionKey } : {}),
+        ...(!targetSessionKey && targetSessionId ? { sessionId: targetSessionId } : {}),
         message: syntheticMessage,
-        prompt: syntheticMessage,
-        resumeFromEntryId: entryId,
-        activeHeadEntryId: entryId
+        label: branchLabel,
+        deliver: false,
+        channel: "webchat"
       });
 
       if (rpcResult !== undefined) {
-        return unwrapRpcResult(rpcResult);
+        const unwrapped = unwrapRpcResult(rpcResult);
+        const resolvedSession = await resolveSessionRecord(api, agentId, {
+          sessionId: targetSessionId,
+          sessionKey: targetSessionKey
+        });
+
+        return {
+          started: true,
+          runId: unwrapped?.runId ?? null,
+          sessionId: resolvedSession?.sessionId ?? targetSessionId ?? null,
+          sessionKey: resolvedSession?.sessionKey ?? targetSessionKey ?? null,
+          label: branchLabel
+        };
+      }
+
+      const directResult = await callFirstHelper(api, [
+        ["runtime", "agent", "startRun"],
+        ["runtime", "runs", "start"],
+        ["runtime", "runControl", "startRun"]
+      ], {
+        agentId,
+        sessionId: targetSessionId,
+        sessionKey: targetSessionKey,
+        message: syntheticMessage,
+        prompt: syntheticMessage
+      });
+
+      if (directResult !== undefined) {
+        return {
+          started: directResult === true || directResult?.started !== false,
+          runId: directResult?.runId ?? null,
+          sessionId: targetSessionId ?? null,
+          sessionKey: targetSessionKey ?? null,
+          label: branchLabel
+        };
       }
 
       throw new StepRollbackError(
         "CONTINUE_START_FAILED",
-        "OpenClaw did not expose a runtime helper or Gateway caller that the plugin could use to continue the run.",
-        { agentId, sessionId, entryId }
+        "OpenClaw did not expose a Gateway caller or startRun helper that the plugin could use to continue in a branched session.",
+        { agentId, sessionId: targetSessionId, sessionKey: targetSessionKey, entryId }
       );
     },
 
-    async createSession({ agentId, sourceSessionId, sourceEntryId }) {
+    async createSession({ agentId, sourceSessionId, sourceEntryId, branchId }) {
       const directResult = await callFirstHelper(api, [
         ["runtime", "sessions", "createSession"],
         ["runtime", "session", "create"],
@@ -645,12 +1042,13 @@ function createNativeHostBridge(api, logger) {
         return directResult;
       }
 
-      const sessionId = crypto.randomUUID();
-      logger.warn(
-        `[${manifest.id}] No documented session-create helper was found. Falling back to a generated session id '${sessionId}'.`
-      );
-
-      return { sessionId, assumed: true };
+      const sessionKey = buildBranchSessionKey(agentId, branchId ?? crypto.randomUUID());
+      return {
+        sessionId: crypto.randomUUID(),
+        sessionKey,
+        label: buildBranchSessionLabel(sourceSessionId, branchId ?? "branch"),
+        assumed: true
+      };
     }
   };
 }
@@ -700,11 +1098,14 @@ function registerLifecycleHooks(api, engine, logger) {
 
   for (const binding of HOOK_BINDINGS) {
     const handler = async (event, ctx) => {
-      const normalized = normalizeHookContext(binding.kind, event, ctx);
+      const normalized = {
+        ...normalizeHookContext(binding.kind, event, ctx),
+        hookName: binding.hookName
+      };
 
       try {
         logger.info?.(
-          `[${manifest.id}] hook '${binding.hookName}' agent='${normalized.agentId ?? "-"}' session='${normalized.sessionId ?? "-"}' entry='${normalized.entryId ?? "-"}' node='${normalized.nodeIndex ?? "-"}' tool='${normalized.toolName ?? "-"}' cwd='${normalized.cwd ?? "-"}'`
+          `[${manifest.id}] hook '${binding.hookName}' agent='${normalized.agentId ?? "-"}' session='${normalized.sessionId ?? "-"}' tool='${normalized.toolName ?? "-"}' toolCallId='${normalized.toolCallId ?? "-"}' entry='${normalized.entryId ?? "-"}' node='${normalized.nodeIndex ?? "-"}'`
         );
 
         if (!normalized.agentId || !normalized.sessionId) {
@@ -715,12 +1116,15 @@ function registerLifecycleHooks(api, engine, logger) {
         }
 
         if (binding.kind === "tool") {
-          if (!normalized.entryId || !Number.isInteger(normalized.nodeIndex) || !normalized.toolName) {
+          if (!normalized.toolName) {
             logger.warn?.(
-              `[${manifest.id}] Skipping hook '${binding.hookName}' because entryId, nodeIndex, or toolName was missing. eventKeys=${Object.keys(event ?? {}).join(",")} ctxKeys=${Object.keys(ctx ?? {}).join(",")}`
+              `[${manifest.id}] Skipping hook '${binding.hookName}' because toolName was missing. eventKeys=${Object.keys(event ?? {}).join(",")} ctxKeys=${Object.keys(ctx ?? {}).join(",")}`
             );
             return null;
           }
+
+          const resolvedToolContext = await resolveToolHookContext(api, engine, normalized, logger);
+          return engine.hooks[binding.handlerName](resolvedToolContext);
         }
 
         return engine.hooks[binding.handlerName](normalized);
@@ -761,7 +1165,7 @@ function registerService(api, engine, logger) {
   });
 }
 
-function registerCli(api, engine) {
+function registerCli(api, engine, cliMethodInvoker) {
   if (typeof api?.registerCli !== "function") {
     return;
   }
@@ -827,9 +1231,12 @@ function registerCli(api, engine) {
         .requiredOption("--session <sessionId>")
         .option("--json", "Output raw JSON.")
         .action(async (options) => {
-          const result = await engine.methods["steprollback.checkpoints.list"]({
+          const result = await cliMethodInvoker("steprollback.checkpoints.list", {
             agentId: options.agent,
             sessionId: options.session
+          }, {
+            preferGateway: true,
+            fallbackToLocal: true
           });
           printRows(
             result.checkpoints,
@@ -854,8 +1261,11 @@ function registerCli(api, engine) {
         .requiredOption("--checkpoint <checkpointId>")
         .option("--json", "Output raw JSON.")
         .action(async (options) => {
-          const result = await engine.methods["steprollback.checkpoints.get"]({
+          const result = await cliMethodInvoker("steprollback.checkpoints.get", {
             checkpointId: options.checkpoint
+          }, {
+            preferGateway: true,
+            fallbackToLocal: true
           });
           printObject(result.checkpoint, options);
         });
@@ -867,9 +1277,12 @@ function registerCli(api, engine) {
         .requiredOption("--session <sessionId>")
         .option("--json", "Output raw JSON.")
         .action(async (options) => {
-          const result = await engine.methods["steprollback.rollback.status"]({
+          const result = await cliMethodInvoker("steprollback.rollback.status", {
             agentId: options.agent,
             sessionId: options.session
+          }, {
+            preferGateway: true,
+            fallbackToLocal: true
           });
           printObject(result, options);
         });
@@ -882,10 +1295,13 @@ function registerCli(api, engine) {
         .requiredOption("--checkpoint <checkpointId>")
         .option("--json", "Output raw JSON.")
         .action(async (options) => {
-          const result = await engine.methods["steprollback.rollback"]({
+          const result = await cliMethodInvoker("steprollback.rollback", {
             agentId: options.agent,
             sessionId: options.session,
             checkpointId: options.checkpoint
+          }, {
+            preferGateway: true,
+            fallbackToLocal: false
           });
           printObject(result, options);
         });
@@ -898,10 +1314,14 @@ function registerCli(api, engine) {
         .option("--prompt <text>", "Optional continuation prompt.")
         .option("--json", "Output raw JSON.")
         .action(async (options) => {
-          const result = await engine.methods["steprollback.continue"]({
+          const result = await cliMethodInvoker("steprollback.continue", {
             agentId: options.agent,
             sessionId: options.session,
             prompt: options.prompt
+          }, {
+            preferGateway: true,
+            fallbackToLocal: false,
+            expectFinal: true
           });
           printObject(result, options);
         });
@@ -913,9 +1333,12 @@ function registerCli(api, engine) {
         .requiredOption("--session <sessionId>")
         .option("--json", "Output raw JSON.")
         .action(async (options) => {
-          const result = await engine.methods["steprollback.session.nodes.list"]({
+          const result = await cliMethodInvoker("steprollback.session.nodes.list", {
             agentId: options.agent,
             sessionId: options.session
+          }, {
+            preferGateway: true,
+            fallbackToLocal: true
           });
           printRows(
             result.nodes,
@@ -943,12 +1366,16 @@ function registerCli(api, engine) {
         .option("--prompt <text>", "Optional prompt used when continuing after checkout.")
         .option("--json", "Output raw JSON.")
         .action(async (options) => {
-          const result = await engine.methods["steprollback.session.checkout"]({
+          const result = await cliMethodInvoker("steprollback.session.checkout", {
             agentId: options.agent,
             sourceSessionId: options.sourceSession,
             sourceEntryId: options.entry,
             continueAfterCheckout: optionalBoolean(options.continue) ?? false,
             prompt: options.prompt
+          }, {
+            preferGateway: true,
+            fallbackToLocal: false,
+            expectFinal: Boolean(options.continue)
           });
           printObject(result, options);
         });
@@ -959,8 +1386,11 @@ function registerCli(api, engine) {
         .requiredOption("--rollback <rollbackId>")
         .option("--json", "Output raw JSON.")
         .action(async (options) => {
-          const result = await engine.methods["steprollback.reports.get"]({
+          const result = await cliMethodInvoker("steprollback.reports.get", {
             rollbackId: options.rollback
+          }, {
+            preferGateway: true,
+            fallbackToLocal: true
           });
           printObject(result, options);
         });
@@ -971,8 +1401,11 @@ function registerCli(api, engine) {
         .requiredOption("--branch <branchId>")
         .option("--json", "Output raw JSON.")
         .action(async (options) => {
-          const result = await engine.methods["steprollback.session.branch.get"]({
+          const result = await cliMethodInvoker("steprollback.session.branch.get", {
             branchId: options.branch
+          }, {
+            preferGateway: true,
+            fallbackToLocal: true
           });
           printObject(result, options);
         });
@@ -1001,13 +1434,17 @@ export function createNativeStepRollbackPlugin(options = {}) {
           ...(options.host ?? {})
         }
       });
+      const cliMethodInvoker = createCliMethodInvoker(api, engine, logger, {
+        ...options,
+        cliCwd: options.cliCwd ?? config.workspaceRoots[0] ?? resolveAbsolutePath("~")
+      });
 
       registerGatewayMethods(api, engine, logger);
       registerLifecycleHooks(api, engine, logger);
       registerService(api, engine, logger);
-      registerCli(api, engine);
+      registerCli(api, engine, cliMethodInvoker);
 
-      logger.info?.(`[${manifest.id}] registered native OpenClaw plugin surfaces`);
+      logger.debug?.(`[${manifest.id}] registered native OpenClaw plugin surfaces`);
 
       return engine;
     }

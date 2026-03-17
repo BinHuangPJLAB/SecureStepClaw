@@ -166,6 +166,8 @@ const resumed = await plugin.methods["steprollback.continue"]({
   sessionId: "session-1",
   prompt: "Continue from here, but do not rewrite the config file yet."
 });
+
+console.log(resumed.branchId, resumed.newSessionId, resumed.newSessionKey);
 ```
 
 ## 配置说明
@@ -323,6 +325,8 @@ openclaw gateway call steprollback.checkpoints.list --params '{"agentId":"main",
 openclaw gateway call steprollback.rollback.status --params '{"agentId":"main","sessionId":"<session-id>"}'
 ```
 
+如果当前 CLI 进程没有暴露直接可用的 Gateway caller，那么 `openclaw steprollback rollback`、`openclaw steprollback continue`、`openclaw steprollback checkout` 会自动转成 `openclaw gateway call ...`，所以使用这些命令前请确保 Gateway 正在运行。
+
 ### 8. 使用 rollback 流程
 
 1. 正常启动 OpenClaw 任务。
@@ -352,13 +356,22 @@ openclaw steprollback checkpoints --agent main --session <session-id>
 3. `plugins.allow` 是否包含 `step-rollback`。
 4. 修改代码后是否已经重启 Gateway。
 5. 你检查的是不是“Git 快照版本插件加载之后”新产生并真正执行过 tool 的 session。
+6. 如果你是在终端里执行 `rollback`、`continue`、`checkout` 这类会修改 session 状态的命令，请确认 Gateway 仍在运行。
 
 当 checkpoint 正常创建时，插件会把内容放在：
 
 - `~/.openclaw/plugins/step-rollback/checkpoints/`：checkpoint 清单和运行时状态
 - `~/.openclaw/plugins/step-rollback/checkpoints/_git/`：每个 workspace root 对应的 Git 快照仓库
 
-最近的版本还会在终端里打印解析后的插件配置，以及每一次 `before_tool_call` 的 checkpoint 创建日志。如果你的 OpenClaw 配置里仍然写着 `/Users/you/...`，插件现在会自动修正为当前用户的 home 目录，并打印 warning 方便排查。
+最近的版本会只打印真正有用的 checkpoint 调试日志：
+
+- 是否收到了 `before_tool_call` / `after_tool_call` hook
+- 是否把 `toolCallId` 成功解析成了 `entryId/nodeIndex`
+- 是否初始化了 Git 快照仓库
+- 每次 checkpoint 提交前当前 workspace 的 Git 脏状态摘要
+- checkpoint 的创建与 reconcile 结果
+
+如果你的 OpenClaw 配置里仍然写着 `/Users/you/...`，插件会自动改写到当前用户的 home 目录，并打印 warning。
 
 6. 执行回退：
 
@@ -374,10 +387,23 @@ openclaw steprollback rollback-status --agent main --session <session-id>
 
 8. 继续执行。
 
+重要：`continue` 现在不会再原地修改旧 session，而是先恢复 checkpoint 对应的 workspace，再创建一个新的 branch session，并在那个新 session 里通过 Gateway 启动新的 `agent` run。命令输出会带上 `branchId`、`newSessionId`、`newSessionKey`。
+
 不带 prompt：
 
 ```bash
 openclaw steprollback continue --agent main --session <session-id>
+```
+
+典型返回字段：
+
+```json
+{
+  "continued": true,
+  "branchId": "br_0001",
+  "newSessionId": "....",
+  "newSessionKey": "agent:main:direct:step-rollback-br_0001"
+}
 ```
 
 带 prompt：
