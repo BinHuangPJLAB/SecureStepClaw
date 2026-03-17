@@ -120,6 +120,32 @@ async function withEnv(name, value, fn) {
   }
 }
 
+async function withTempEnv(entries, fn) {
+  const previous = new Map();
+
+  for (const [key, value] of Object.entries(entries)) {
+    previous.set(key, process.env[key]);
+
+    if (value === undefined || value === null) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+
+  try {
+    return await fn();
+  } finally {
+    for (const [key, value] of previous.entries()) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
+
 test("creates checkpoints, rolls back workspace state, and continues from the checkpoint", async () => {
   const fixture = await createFixture();
   const calls = {
@@ -949,6 +975,16 @@ test("offers flag-based CLI commands for agents, sessions, rollback, and continu
   });
   assert.match(rollbackOutput, /rollbackId/);
   assert.equal(await fs.readFile(path.join(fixture.workspace, "cli.txt"), "utf8"), "stable\n");
+  assert.equal(
+    cliGatewayCalls.some(
+      (call) =>
+        call.methodName === "steprollback.rollback" &&
+        call.params.agentId === "main" &&
+        call.params.sessionId === "session-cli" &&
+        call.params.checkpointId === checkpointId
+    ),
+    false
+  );
 
   const continueOutput = await captureConsoleLog(async () => {
     await cliHarness.commands.get("steprollback continue").action({
@@ -959,6 +995,7 @@ test("offers flag-based CLI commands for agents, sessions, rollback, and continu
   });
   assert.match(continueOutput, /continued/);
   assert.match(continueOutput, /usedPrompt/);
+  assert.match(continueOutput, /session-checkout-cli/);
   assert.equal(
     cliGatewayCalls.some(
       (call) =>
@@ -967,16 +1004,281 @@ test("offers flag-based CLI commands for agents, sessions, rollback, and continu
         call.params.sessionId === "session-cli" &&
         call.params.prompt === "Inspect first."
     ),
-    true
-  );
-  assert.equal(
-    cliGatewayBehaviors.some(
-      (behavior, index) =>
-        cliGatewayCalls[index]?.methodName === "steprollback.continue" &&
-        behavior.expectFinal === true
-    ),
     false
   );
+});
+
+test("falls back to spawned gateway call with auth from config for gateway-delegated CLI commands", async () => {
+  const fixture = await createFixture();
+  const registered = {
+    methods: new Map(),
+    hooks: new Map(),
+    services: [],
+    clis: []
+  };
+  const gatewayCapturePath = path.join(fixture.root, "gateway-capture.json");
+  const fakeGatewayPath = path.join(fixture.root, "fake-openclaw");
+
+  await fs.writeFile(
+    fakeGatewayPath,
+    `#!/usr/bin/env node
+const fs = require("node:fs/promises");
+
+(async () => {
+  const args = process.argv.slice(2);
+  await fs.writeFile(process.env.STEP_ROLLBACK_FAKE_GATEWAY_CAPTURE, JSON.stringify({ args }, null, 2));
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    data: {
+      continued: true,
+      newSessionId: "branch-from-cli"
+    }
+  }));
+})().catch((error) => {
+  console.error(error && error.message ? error.message : String(error));
+  process.exit(1);
+});
+`,
+    "utf8"
+  );
+  await fs.chmod(fakeGatewayPath, 0o755);
+
+  const api = {
+    config: {
+      gateway: {
+        auth: {
+          mode: "token",
+          token: "token-from-config"
+        }
+      },
+      plugins: {
+        entries: {
+          "step-rollback": {
+            config: {
+              workspaceRoots: [fixture.workspace],
+              checkpointDir: fixture.checkpointDir,
+              registryDir: fixture.registryDir,
+              runtimeDir: fixture.runtimeDir,
+              reportsDir: fixture.reportsDir
+            }
+          }
+        }
+      }
+    },
+    logger: {
+      info() {},
+      warn() {},
+      error() {},
+      debug() {}
+    },
+    runtime: {
+      gateway: {
+        async call() {
+          throw new Error("gateway closed (1006 abnormal closure (no close frame)): no close reason");
+        }
+      }
+    },
+    registerGatewayMethod(name, handler) {
+      registered.methods.set(name, handler);
+    },
+    registerHook(name, handler, options) {
+      registered.hooks.set(name, { handler, options });
+    },
+    on(name, handler, options) {
+      registered.hooks.set(name, { handler, options });
+    },
+    registerService(service) {
+      registered.services.push(service);
+    },
+    registerCli(factory, meta) {
+      registered.clis.push({ factory, meta });
+    }
+  };
+
+  await createNativeStepRollbackPlugin({
+    gatewayCommand: fakeGatewayPath
+  }).register(api);
+
+  const cliHarness = createFakeProgram();
+  registered.clis[0].factory({ program: cliHarness.program });
+
+  const output = await withTempEnv({
+    STEP_ROLLBACK_FAKE_GATEWAY_CAPTURE: gatewayCapturePath
+  }, async () =>
+    captureConsoleLog(async () => {
+      await cliHarness.commands.get("steprollback rollback-status").action({
+        agent: "main",
+        session: "session-auth"
+      });
+    })
+  );
+
+  assert.match(output, /newSessionId/);
+  assert.match(output, /branch-from-cli/);
+
+  const capture = JSON.parse(await fs.readFile(gatewayCapturePath, "utf8"));
+  assert.equal(capture.args.includes("gateway"), true);
+  assert.equal(capture.args.includes("call"), true);
+  assert.equal(capture.args.includes("steprollback.rollback.status"), true);
+  assert.equal(capture.args.includes("--token"), true);
+  assert.equal(capture.args.includes("token-from-config"), true);
+  assert.equal(capture.args.includes("--expect-final"), false);
+});
+
+test("continues locally by spawning 'openclaw agent' and recording the new branch session", async () => {
+  const fixture = await createFixture();
+  const registered = {
+    methods: new Map(),
+    hooks: new Map(),
+    services: [],
+    clis: []
+  };
+  const fakeAgentCapturePath = path.join(fixture.root, "agent-capture.json");
+  const fakeOpenclawPath = path.join(fixture.root, "fake-openclaw-agent");
+  const sessionStoreTemplate = path.join(fixture.root, "agents", "{agentId}", "sessions", "sessions.json");
+
+  await fs.writeFile(
+    fakeOpenclawPath,
+    `#!/usr/bin/env node
+const fs = require("node:fs/promises");
+
+(async () => {
+  const args = process.argv.slice(2);
+  await fs.writeFile(process.env.STEP_ROLLBACK_FAKE_AGENT_CAPTURE, JSON.stringify({ args }, null, 2));
+  process.stdout.write(JSON.stringify({
+    sessionId: "branch-from-agent",
+    sessionKey: "agent:main:direct:branch-from-agent",
+    runId: "run-branch-agent"
+  }));
+})().catch((error) => {
+  console.error(error && error.message ? error.message : String(error));
+  process.exit(1);
+});
+`,
+    "utf8"
+  );
+  await fs.chmod(fakeOpenclawPath, 0o755);
+
+  const api = {
+    config: {
+      agents: {
+        list: [
+          {
+            id: "main",
+            name: "main",
+            workspace: fixture.workspace,
+            model: "gpt-test"
+          }
+        ]
+      },
+      session: {
+        storePath: sessionStoreTemplate
+      },
+      plugins: {
+        entries: {
+          "step-rollback": {
+            config: {
+              workspaceRoots: [fixture.workspace],
+              checkpointDir: fixture.checkpointDir,
+              registryDir: fixture.registryDir,
+              runtimeDir: fixture.runtimeDir,
+              reportsDir: fixture.reportsDir
+            }
+          }
+        }
+      }
+    },
+    logger: {
+      info() {},
+      warn() {},
+      error() {},
+      debug() {}
+    },
+    registerGatewayMethod(name, handler) {
+      registered.methods.set(name, handler);
+    },
+    registerHook(name, handler, options) {
+      registered.hooks.set(name, { handler, options });
+    },
+    on(name, handler, options) {
+      registered.hooks.set(name, { handler, options });
+    },
+    registerService(service) {
+      registered.services.push(service);
+    },
+    registerCli(factory, meta) {
+      registered.clis.push({ factory, meta });
+    }
+  };
+
+  await fs.writeFile(path.join(fixture.workspace, "continue.txt"), "stable\n", "utf8");
+
+  await createNativeStepRollbackPlugin({
+    gatewayCommand: fakeOpenclawPath
+  }).register(api);
+
+  const cliHarness = createFakeProgram();
+  registered.clis[0].factory({ program: cliHarness.program });
+
+  await registered.hooks.get("session_start").handler({
+    agentId: "main",
+    sessionId: "session-continue-cli",
+    runId: "run-continue-cli"
+  });
+  await registered.hooks.get("before_tool_call").handler({
+    agentId: "main",
+    sessionId: "session-continue-cli",
+    entryId: "entry-continue-cli",
+    nodeIndex: 1,
+    toolName: "write",
+    params: {
+      file_path: path.join(fixture.workspace, "continue.txt"),
+      content: "broken\n"
+    },
+    runId: "run-continue-cli"
+  });
+  await fs.writeFile(path.join(fixture.workspace, "continue.txt"), "broken\n", "utf8");
+
+  const checkpointList = await registered.methods.get("steprollback.checkpoints.list")({
+    params: {
+      agentId: "main",
+      sessionId: "session-continue-cli"
+    }
+  });
+  const checkpointId = checkpointList.checkpoints[0].checkpointId;
+
+  await registered.methods.get("steprollback.rollback")({
+    params: {
+      agentId: "main",
+      sessionId: "session-continue-cli",
+      checkpointId
+    }
+  });
+
+  const output = await withTempEnv({
+    STEP_ROLLBACK_FAKE_AGENT_CAPTURE: fakeAgentCapturePath
+  }, async () =>
+    captureConsoleLog(async () => {
+      await cliHarness.commands.get("steprollback continue").action({
+        agent: "main",
+        session: "session-continue-cli",
+        prompt: "Check docs, but do not delete files."
+      });
+    })
+  );
+
+  assert.match(output, /continued/);
+  assert.match(output, /branch-from-agent/);
+  assert.equal(await fs.readFile(path.join(fixture.workspace, "continue.txt"), "utf8"), "stable\n");
+
+  const capture = JSON.parse(await fs.readFile(fakeAgentCapturePath, "utf8"));
+  assert.equal(capture.args[0], "agent");
+  assert.equal(capture.args.includes("--agent"), true);
+  assert.equal(capture.args.includes("main"), true);
+  assert.equal(capture.args.includes("--message"), true);
+  assert.equal(capture.args.includes("Check docs, but do not delete files."), true);
+  assert.equal(capture.args.includes("--json"), true);
+  assert.equal(capture.args.includes("gateway"), false);
 });
 
 test("maps agents.defaults to main and accepts default aliases in CLI and Gateway methods", async () => {

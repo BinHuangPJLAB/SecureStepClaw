@@ -326,7 +326,11 @@ openclaw gateway call steprollback.checkpoints.list --params '{"agentId":"main",
 openclaw gateway call steprollback.rollback.status --params '{"agentId":"main","sessionId":"<session-id>"}'
 ```
 
-`openclaw steprollback rollback`, `openclaw steprollback continue`, and `openclaw steprollback checkout` delegate through `openclaw gateway call ...` when the CLI process does not expose a direct Gateway caller, so keep Gateway running before you use those commands.
+Read-only/admin commands such as `openclaw steprollback rollback-status`, `openclaw steprollback checkpoint`, and `openclaw steprollback report` can still delegate through `openclaw gateway call ...` when the CLI process does not expose a direct Gateway caller.
+
+Mutating commands are now local-first from the CLI:
+- `openclaw steprollback rollback` runs the rollback engine directly in the plugin process.
+- `openclaw steprollback continue` restores the checkpoint locally, then launches a fresh branch turn with the official `openclaw agent --agent ... --message ... --json` command.
 
 ### 8. Use the rollback flow
 
@@ -388,7 +392,7 @@ openclaw steprollback rollback-status --agent main --session <session-id>
 
 8. Continue execution.
 
-Important: `continue` no longer mutates the original session in place. It restores the checkpointed workspace, creates a new branched session, and starts a fresh Gateway `agent` run there. The command output includes `branchId`, `newSessionId`, and `newSessionKey`.
+Important: `continue` no longer mutates the original session in place. It restores the checkpointed workspace, creates a new branched session, and starts a fresh branch turn by calling `openclaw agent`. The command output includes `branchId`, `newSessionId`, and `newSessionKey`.
 
 Without a prompt:
 

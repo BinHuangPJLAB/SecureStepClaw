@@ -327,7 +327,11 @@ openclaw gateway call steprollback.checkpoints.list --params '{"agentId":"main",
 openclaw gateway call steprollback.rollback.status --params '{"agentId":"main","sessionId":"<session-id>"}'
 ```
 
-如果当前 CLI 进程没有暴露直接可用的 Gateway caller，那么 `openclaw steprollback rollback`、`openclaw steprollback continue`、`openclaw steprollback checkout` 会自动转成 `openclaw gateway call ...`，所以使用这些命令前请确保 Gateway 正在运行。
+像 `openclaw steprollback rollback-status`、`openclaw steprollback checkpoint`、`openclaw steprollback report` 这类读状态/管理类命令，如果当前 CLI 进程没有暴露直接可用的 Gateway caller，仍然会自动转成 `openclaw gateway call ...`。
+
+修改状态的命令现在在 CLI 中都会优先走本地逻辑：
+- `openclaw steprollback rollback` 会直接在插件进程里运行 rollback engine。
+- `openclaw steprollback continue` 不会再从 CLI 里绕一圈插件 Gateway RPC。它会先在本地恢复 checkpoint，然后调用官方的 `openclaw agent --agent ... --message ... --json` 来启动新的 branch turn。
 
 ### 8. 使用 rollback 流程
 
@@ -389,7 +393,7 @@ openclaw steprollback rollback-status --agent main --session <session-id>
 
 8. 继续执行。
 
-重要：`continue` 现在不会再原地修改旧 session，而是先恢复 checkpoint 对应的 workspace，再创建一个新的 branch session，并在那个新 session 里通过 Gateway 启动新的 `agent` run。命令输出会带上 `branchId`、`newSessionId`、`newSessionKey`。
+重要：`continue` 现在不会再原地修改旧 session，而是先恢复 checkpoint 对应的 workspace，再创建一个新的 branch session，并通过 `openclaw agent` 启动新的 branch turn。命令输出会带上 `branchId`、`newSessionId`、`newSessionKey`。
 
 不带 prompt：
 
