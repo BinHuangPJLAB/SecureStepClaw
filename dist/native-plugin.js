@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 
 import { StepRollbackError, toStepRollbackError } from "./core/errors.js";
+import { readJson, resolveAbsolutePath } from "./core/utils.js";
 import { createStepRollbackPlugin, manifest } from "./plugin.js";
 
 const HOOK_BINDINGS = [
@@ -245,6 +246,240 @@ function toNativeErrorPayload(error) {
   };
 }
 
+function normalizeRecordArray(value) {
+  if (Array.isArray(value)) {
+    return value;
+  }
+
+  if (Array.isArray(value?.sessions)) {
+    return value.sessions;
+  }
+
+  if (Array.isArray(value?.items)) {
+    return value.items;
+  }
+
+  if (value && typeof value === "object") {
+    return Object.values(value);
+  }
+
+  return [];
+}
+
+function normalizeTimestamp(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+
+    if (!trimmed) {
+      return null;
+    }
+
+    if (/^\d+$/.test(trimmed)) {
+      const numeric = Number(trimmed);
+      if (Number.isFinite(numeric)) {
+        const date = new Date(numeric);
+        return Number.isNaN(date.getTime()) ? null : date;
+      }
+    }
+
+    const parsed = new Date(trimmed);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  return null;
+}
+
+function formatTimestamp(value) {
+  const date = normalizeTimestamp(value);
+
+  if (!date) {
+    return "-";
+  }
+
+  const year = String(date.getFullYear());
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const seconds = String(date.getSeconds()).padStart(2, "0");
+
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
+function timestampSortValue(...values) {
+  for (const value of values) {
+    const date = normalizeTimestamp(value);
+    if (date) {
+      return date.getTime();
+    }
+  }
+
+  return 0;
+}
+
+function getConfiguredAgents(api) {
+  const configured = pickFirst(
+    api?.config?.agents?.list,
+    api?.config?.agents?.entries,
+    api?.config?.agents
+  );
+
+  if (Array.isArray(configured)) {
+    return configured
+      .map((entry) => {
+        if (typeof entry === "string") {
+          return { id: entry, name: entry };
+        }
+
+        if (entry && typeof entry === "object") {
+          return {
+            id: pickFirst(entry.id, entry.name, entry.agentId),
+            name: pickFirst(entry.name, entry.id, entry.agentId),
+            workspace: pickFirst(entry.workspace, entry.workspaceRoot, entry.cwd, entry.root),
+            model: pickFirst(entry.model, entry.defaultModel)
+          };
+        }
+
+        return null;
+      })
+      .filter((entry) => entry?.id);
+  }
+
+  if (configured && typeof configured === "object") {
+    return Object.entries(configured).map(([id, entry]) => ({
+      id,
+      name: pickFirst(entry?.name, id),
+      workspace: pickFirst(entry?.workspace, entry?.workspaceRoot, entry?.cwd, entry?.root),
+      model: pickFirst(entry?.model, entry?.defaultModel)
+    }));
+  }
+
+  return [{ id: "main", name: "main" }];
+}
+
+function resolveSessionIndexPath(api, agentId) {
+  const configuredPath = pickFirst(
+    api?.config?.session?.storePath,
+    api?.config?.session?.indexPath,
+    api?.config?.sessions?.storePath,
+    api?.config?.sessions?.indexPath
+  );
+  const template = typeof configuredPath === "string"
+    ? configuredPath
+    : "~/.openclaw/agents/{agentId}/sessions/sessions.json";
+
+  return resolveAbsolutePath(
+    template
+      .replaceAll("{agentId}", agentId)
+      .replaceAll("{agent}", agentId)
+  );
+}
+
+async function listSessionsForAgent(api, agentId) {
+  const sessionIndexPath = resolveSessionIndexPath(api, agentId);
+  const contents = await readJson(sessionIndexPath, []);
+
+  const sessions = normalizeRecordArray(contents)
+    .map((entry) => ({
+      sessionId: pickFirst(entry?.sessionId, entry?.id),
+      title: pickFirst(entry?.title, entry?.summary, entry?.label) || "(untitled)",
+      createdAtRaw: pickFirst(entry?.createdAt, entry?.startedAt),
+      updatedAtRaw: pickFirst(entry?.updatedAt, entry?.lastUpdatedAt, entry?.lastActivityAt),
+      branchOf: pickFirst(entry?.branchOf, entry?.sourceSessionId)
+    }))
+    .filter((entry) => entry.sessionId)
+    .sort(
+      (left, right) =>
+        timestampSortValue(right.updatedAtRaw, right.createdAtRaw) -
+        timestampSortValue(left.updatedAtRaw, left.createdAtRaw)
+    )
+    .map((entry, index) => ({
+      sessionId: entry.sessionId,
+      marker: index === 0 ? "latest" : "",
+      title: entry.title,
+      updatedAt: formatTimestamp(entry.updatedAtRaw),
+      createdAt: formatTimestamp(entry.createdAtRaw),
+      branchOf: entry.branchOf ?? "-"
+    }));
+
+  return sessions;
+}
+
+function formatValue(value) {
+  if (value === undefined || value === null || value === "") {
+    return "-";
+  }
+
+  if (typeof value === "object") {
+    return JSON.stringify(value);
+  }
+
+  return String(value);
+}
+
+function renderTable(rows, columns) {
+  const widths = columns.map((column) => {
+    const headerWidth = column.label.length;
+    const valueWidth = rows.reduce((max, row) => Math.max(max, formatValue(row[column.key]).length), 0);
+    return Math.max(headerWidth, valueWidth);
+  });
+
+  const header = columns
+    .map((column, index) => column.label.padEnd(widths[index], " "))
+    .join("  ");
+  const divider = widths.map((width) => "-".repeat(width)).join("  ");
+  const lines = rows.map((row) =>
+    columns
+      .map((column, index) => formatValue(row[column.key]).padEnd(widths[index], " "))
+      .join("  ")
+  );
+
+  return [header, divider, ...lines].join("\n");
+}
+
+function printRows(rows, columns, options = {}) {
+  if (options.json) {
+    console.log(JSON.stringify(rows, null, 2));
+    return;
+  }
+
+  if (!rows.length) {
+    console.log(options.emptyMessage ?? "No records found.");
+    return;
+  }
+
+  console.log(renderTable(rows, columns));
+}
+
+function printObject(value, options = {}) {
+  if (options.json || !value || typeof value !== "object" || Array.isArray(value)) {
+    console.log(JSON.stringify(value, null, 2));
+    return;
+  }
+
+  const rows = Object.entries(value).map(([key, entryValue]) => ({
+    field: key,
+    value: formatValue(entryValue)
+  }));
+  console.log(renderTable(rows, [
+    { key: "field", label: "Field" },
+    { key: "value", label: "Value" }
+  ]));
+}
+
+function optionalBoolean(value) {
+  return value === undefined ? undefined : Boolean(value);
+}
+
 function createNativeHostBridge(api, logger) {
   return {
     async stopRun({ agentId, sessionId, runId }) {
@@ -390,12 +625,15 @@ function registerGatewayMethods(api, engine, logger) {
 }
 
 function registerLifecycleHooks(api, engine, logger) {
-  if (typeof api?.on !== "function") {
-    throw new StepRollbackError("CONTINUE_START_FAILED", "OpenClaw plugin API did not provide api.on(...).");
+  if (typeof api?.registerHook !== "function" && typeof api?.on !== "function") {
+    throw new StepRollbackError(
+      "CONTINUE_START_FAILED",
+      "OpenClaw plugin API did not provide registerHook(...) or api.on(...)."
+    );
   }
 
   for (const binding of HOOK_BINDINGS) {
-    api.on(binding.hookName, async (event, ctx) => {
+    const handler = async (event, ctx) => {
       const normalized = normalizeHookContext(binding.kind, event, ctx);
 
       try {
@@ -420,6 +658,16 @@ function registerLifecycleHooks(api, engine, logger) {
         );
         throw error;
       }
+    };
+
+    if (typeof api?.on === "function") {
+      api.on(binding.hookName, handler);
+      continue;
+    }
+
+    api.registerHook(binding.hookName, handler, {
+      name: `${manifest.id}.${binding.hookName}`,
+      description: `Step Rollback handler for ${binding.hookName}`
     });
   }
 }
@@ -456,27 +704,205 @@ function registerCli(api, engine) {
       });
 
       command
+        .command("agents")
+        .description("List configured OpenClaw agents.")
+        .option("--json", "Output raw JSON.")
+        .action(async (options) => {
+          const agents = getConfiguredAgents(api);
+          printRows(
+            agents,
+            [
+              { key: "id", label: "Agent" },
+              { key: "name", label: "Name" },
+              { key: "workspace", label: "Workspace" },
+              { key: "model", label: "Model" }
+            ],
+            {
+              json: options.json,
+              emptyMessage: "No agents were found in the OpenClaw config."
+            }
+          );
+        });
+
+      command
+        .command("sessions")
+        .description("List sessions for an agent without passing JSON.")
+        .requiredOption("--agent <agentId>")
+        .option("--json", "Output raw JSON.")
+        .action(async (options) => {
+          const sessions = await listSessionsForAgent(api, options.agent);
+          printRows(
+            sessions,
+            [
+              { key: "marker", label: "Mark" },
+              { key: "sessionId", label: "Session" },
+              { key: "title", label: "Title" },
+              { key: "updatedAt", label: "Updated" },
+              { key: "createdAt", label: "Created" },
+              { key: "branchOf", label: "Branch Of" }
+            ],
+            {
+              json: options.json,
+              emptyMessage: `No sessions were found for agent '${options.agent}'.`
+            }
+          );
+        });
+
+      command
         .command("checkpoints")
+        .description("List checkpoints for a session.")
         .requiredOption("--agent <agentId>")
         .requiredOption("--session <sessionId>")
+        .option("--json", "Output raw JSON.")
         .action(async (options) => {
           const result = await engine.methods["steprollback.checkpoints.list"]({
             agentId: options.agent,
             sessionId: options.session
           });
-          console.log(JSON.stringify(result, null, 2));
+          printRows(
+            result.checkpoints,
+            [
+              { key: "checkpointId", label: "Checkpoint" },
+              { key: "nodeIndex", label: "Node" },
+              { key: "toolName", label: "Tool" },
+              { key: "status", label: "Status" },
+              { key: "createdAt", label: "Created" },
+              { key: "summary", label: "Summary" }
+            ],
+            {
+              json: options.json,
+              emptyMessage: `No checkpoints were found for session '${options.session}'.`
+            }
+          );
+        });
+
+      command
+        .command("checkpoint")
+        .description("Show one checkpoint by id.")
+        .requiredOption("--checkpoint <checkpointId>")
+        .option("--json", "Output raw JSON.")
+        .action(async (options) => {
+          const result = await engine.methods["steprollback.checkpoints.get"]({
+            checkpointId: options.checkpoint
+          });
+          printObject(result.checkpoint, options);
         });
 
       command
         .command("rollback-status")
+        .description("Show rollback state for a session.")
         .requiredOption("--agent <agentId>")
         .requiredOption("--session <sessionId>")
+        .option("--json", "Output raw JSON.")
         .action(async (options) => {
           const result = await engine.methods["steprollback.rollback.status"]({
             agentId: options.agent,
             sessionId: options.session
           });
-          console.log(JSON.stringify(result, null, 2));
+          printObject(result, options);
+        });
+
+      command
+        .command("rollback")
+        .description("Rollback a session to a checkpoint.")
+        .requiredOption("--agent <agentId>")
+        .requiredOption("--session <sessionId>")
+        .requiredOption("--checkpoint <checkpointId>")
+        .option("--json", "Output raw JSON.")
+        .action(async (options) => {
+          const result = await engine.methods["steprollback.rollback"]({
+            agentId: options.agent,
+            sessionId: options.session,
+            checkpointId: options.checkpoint
+          });
+          printObject(result, options);
+        });
+
+      command
+        .command("continue")
+        .description("Continue a rolled back session, with an optional prompt.")
+        .requiredOption("--agent <agentId>")
+        .requiredOption("--session <sessionId>")
+        .option("--prompt <text>", "Optional continuation prompt.")
+        .option("--json", "Output raw JSON.")
+        .action(async (options) => {
+          const result = await engine.methods["steprollback.continue"]({
+            agentId: options.agent,
+            sessionId: options.session,
+            prompt: options.prompt
+          });
+          printObject(result, options);
+        });
+
+      command
+        .command("nodes")
+        .description("List checkpoint-backed nodes for checkout.")
+        .requiredOption("--agent <agentId>")
+        .requiredOption("--session <sessionId>")
+        .option("--json", "Output raw JSON.")
+        .action(async (options) => {
+          const result = await engine.methods["steprollback.session.nodes.list"]({
+            agentId: options.agent,
+            sessionId: options.session
+          });
+          printRows(
+            result.nodes,
+            [
+              { key: "entryId", label: "Entry" },
+              { key: "nodeIndex", label: "Node" },
+              { key: "toolName", label: "Tool" },
+              { key: "checkoutAvailable", label: "Checkout" },
+              { key: "createdAt", label: "Created" }
+            ],
+            {
+              json: options.json,
+              emptyMessage: `No checkpoint-backed nodes were found for session '${options.session}'.`
+            }
+          );
+        });
+
+      command
+        .command("checkout")
+        .description("Create a new session from a checkpoint-backed entry.")
+        .requiredOption("--agent <agentId>")
+        .requiredOption("--source-session <sessionId>")
+        .requiredOption("--entry <entryId>")
+        .option("--continue", "Continue immediately after checkout.")
+        .option("--prompt <text>", "Optional prompt used when continuing after checkout.")
+        .option("--json", "Output raw JSON.")
+        .action(async (options) => {
+          const result = await engine.methods["steprollback.session.checkout"]({
+            agentId: options.agent,
+            sourceSessionId: options.sourceSession,
+            sourceEntryId: options.entry,
+            continueAfterCheckout: optionalBoolean(options.continue) ?? false,
+            prompt: options.prompt
+          });
+          printObject(result, options);
+        });
+
+      command
+        .command("report")
+        .description("Show a rollback report.")
+        .requiredOption("--rollback <rollbackId>")
+        .option("--json", "Output raw JSON.")
+        .action(async (options) => {
+          const result = await engine.methods["steprollback.reports.get"]({
+            rollbackId: options.rollback
+          });
+          printObject(result, options);
+        });
+
+      command
+        .command("branch")
+        .description("Show a checkout branch record.")
+        .requiredOption("--branch <branchId>")
+        .option("--json", "Output raw JSON.")
+        .action(async (options) => {
+          const result = await engine.methods["steprollback.session.branch.get"]({
+            branchId: options.branch
+          });
+          printObject(result, options);
         });
     },
     { commands: ["steprollback"] }

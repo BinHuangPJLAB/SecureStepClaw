@@ -26,6 +26,62 @@ async function createFixture() {
   };
 }
 
+function createFakeProgram() {
+  const commands = new Map();
+
+  function createCommand(pathParts) {
+    const record = {
+      path: pathParts.join(" "),
+      action: null
+    };
+
+    if (record.path) {
+      commands.set(record.path, record);
+    }
+
+    return {
+      command(name) {
+        return createCommand([...pathParts, name]);
+      },
+      description() {
+        return this;
+      },
+      option() {
+        return this;
+      },
+      requiredOption() {
+        return this;
+      },
+      action(handler) {
+        record.action = handler;
+        return this;
+      }
+    };
+  }
+
+  return {
+    program: createCommand([]),
+    commands
+  };
+}
+
+async function captureConsoleLog(fn) {
+  const original = console.log;
+  const output = [];
+
+  console.log = (...args) => {
+    output.push(args.join(" "));
+  };
+
+  try {
+    await fn();
+  } finally {
+    console.log = original;
+  }
+
+  return output.join("\n");
+}
+
 test("creates checkpoints, rolls back workspace state, and continues from the checkpoint", async () => {
   const fixture = await createFixture();
   const calls = {
@@ -309,6 +365,9 @@ test("registers a native OpenClaw plugin and drives rollback through registered 
     registerGatewayMethod(name, handler) {
       registered.methods.set(name, handler);
     },
+    registerHook(name, handler, options) {
+      registered.hooks.set(name, { handler, options });
+    },
     on(name, handler, options) {
       registered.hooks.set(name, { handler, options });
     },
@@ -349,6 +408,7 @@ test("registers a native OpenClaw plugin and drives rollback through registered 
   assert.equal(registered.methods.has("steprollback.rollback"), true);
   assert.equal(registered.hooks.has("session_start"), true);
   assert.equal(registered.hooks.has("before_tool_call"), true);
+  assert.equal(typeof registered.hooks.get("before_tool_call").handler, "function");
   assert.equal(registered.services.length, 1);
   assert.equal(registered.clis.length, 1);
   assert.deepEqual(registered.clis[0].meta.commands, ["steprollback"]);
@@ -454,6 +514,7 @@ test("returns Gateway-style error payloads for native RPC handlers", async () =>
     registerGatewayMethod(name, handler) {
       registered.set(name, handler);
     },
+    registerHook() {},
     on() {},
     registerService() {},
     registerCli() {}
@@ -476,4 +537,169 @@ test("returns Gateway-style error payloads for native RPC handlers", async () =>
   assert.equal(responses.length, 1);
   assert.equal(responses[0].ok, false);
   assert.equal(responses[0].payload.code, "CHECKPOINT_NOT_FOUND");
+});
+
+test("offers flag-based CLI commands for agents, sessions, rollback, and continue", async () => {
+  const fixture = await createFixture();
+  const registered = {
+    methods: new Map(),
+    hooks: new Map(),
+    services: [],
+    clis: []
+  };
+  const sessionStoreTemplate = path.join(fixture.root, "agents", "{agentId}", "sessions", "sessions.json");
+  const sessionStorePath = sessionStoreTemplate.replace("{agentId}", "main");
+
+  await fs.mkdir(path.dirname(sessionStorePath), { recursive: true });
+  await fs.writeFile(
+    sessionStorePath,
+    `${JSON.stringify([
+      {
+        sessionId: "session-cli",
+        title: "CLI test session",
+        updatedAt: "2026-03-17T12:00:00.000Z"
+      }
+    ], null, 2)}\n`,
+    "utf8"
+  );
+  await fs.writeFile(path.join(fixture.workspace, "cli.txt"), "stable\n", "utf8");
+
+  const api = {
+    config: {
+      agents: {
+        list: [
+          {
+            id: "main",
+            name: "main",
+            workspace: fixture.workspace,
+            model: "gpt-test"
+          }
+        ]
+      },
+      session: {
+        storePath: sessionStoreTemplate
+      },
+      plugins: {
+        entries: {
+          "step-rollback": {
+            config: {
+              workspaceRoots: [fixture.workspace],
+              checkpointDir: fixture.checkpointDir,
+              registryDir: fixture.registryDir,
+              runtimeDir: fixture.runtimeDir,
+              reportsDir: fixture.reportsDir
+            }
+          }
+        }
+      }
+    },
+    logger: {
+      info() {},
+      warn() {},
+      error() {},
+      debug() {}
+    },
+    registerGatewayMethod(name, handler) {
+      registered.methods.set(name, handler);
+    },
+    registerHook(name, handler, options) {
+      registered.hooks.set(name, { handler, options });
+    },
+    on(name, handler, options) {
+      registered.hooks.set(name, { handler, options });
+    },
+    registerService(service) {
+      registered.services.push(service);
+    },
+    registerCli(factory, meta) {
+      registered.clis.push({ factory, meta });
+    },
+    runtime: {
+      gateway: {
+        async call(method, params) {
+          if (method === "agent" && params.message === "/stop") {
+            return { runId: "stop-cli" };
+          }
+
+          if (method === "agent") {
+            return { runId: `run:${params.sessionId}:${params.resumeFromEntryId ?? "tail"}` };
+          }
+
+          return undefined;
+        }
+      }
+    }
+  };
+
+  await createNativeStepRollbackPlugin().register(api);
+
+  const cliHarness = createFakeProgram();
+  registered.clis[0].factory({ program: cliHarness.program });
+
+  await registered.hooks.get("session_start").handler({
+    agentId: "main",
+    sessionId: "session-cli",
+    runId: "run-cli"
+  });
+  await registered.hooks.get("before_tool_call").handler({
+    agentId: "main",
+    sessionId: "session-cli",
+    entryId: "entry-cli",
+    nodeIndex: 1,
+    toolName: "write",
+    runId: "run-cli"
+  });
+  await fs.writeFile(path.join(fixture.workspace, "cli.txt"), "broken\n", "utf8");
+
+  const agentsOutput = await captureConsoleLog(async () => {
+    await cliHarness.commands.get("steprollback agents").action({ agent: "main" });
+  });
+  assert.match(agentsOutput, /Agent/);
+  assert.match(agentsOutput, /main/);
+
+  const sessionsOutput = await captureConsoleLog(async () => {
+    await cliHarness.commands.get("steprollback sessions").action({ agent: "main" });
+  });
+  assert.match(sessionsOutput, /Mark/);
+  assert.match(sessionsOutput, /latest/);
+  assert.match(sessionsOutput, /session-cli/);
+  assert.match(sessionsOutput, /CLI test session/);
+  assert.match(sessionsOutput, /2026-03-17 \d{2}:\d{2}:\d{2}/);
+
+  const checkpointsOutput = await captureConsoleLog(async () => {
+    await cliHarness.commands.get("steprollback checkpoints").action({
+      agent: "main",
+      session: "session-cli"
+    });
+  });
+  assert.match(checkpointsOutput, /Checkpoint/);
+  assert.match(checkpointsOutput, /entry-cli|ckpt_/);
+
+  const checkpointList = await registered.methods.get("steprollback.checkpoints.list")({
+    params: {
+      agentId: "main",
+      sessionId: "session-cli"
+    }
+  });
+  const checkpointId = checkpointList.checkpoints[0].checkpointId;
+
+  const rollbackOutput = await captureConsoleLog(async () => {
+    await cliHarness.commands.get("steprollback rollback").action({
+      agent: "main",
+      session: "session-cli",
+      checkpoint: checkpointId
+    });
+  });
+  assert.match(rollbackOutput, /rollbackId/);
+  assert.equal(await fs.readFile(path.join(fixture.workspace, "cli.txt"), "utf8"), "stable\n");
+
+  const continueOutput = await captureConsoleLog(async () => {
+    await cliHarness.commands.get("steprollback continue").action({
+      agent: "main",
+      session: "session-cli",
+      prompt: "Inspect first."
+    });
+  });
+  assert.match(continueOutput, /continued/);
+  assert.match(continueOutput, /usedPrompt/);
 });

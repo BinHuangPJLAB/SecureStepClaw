@@ -13,7 +13,7 @@
 - 插件清单文件：[`openclaw.plugin.json`](./openclaw.plugin.json)
 - 原生插件运行时入口 `register(api)`：[`dist/native-plugin.js`](./dist/native-plugin.js)
 - 通过 `api.registerGatewayMethod(...)` 注册 Gateway RPC 方法
-- 通过 `api.on(...)` 注册生命周期 hook
+- 优先通过官方 `api.on(...)` 注册生命周期 hook，并保留 `api.registerHook(...)` 兼容回退
 - 插件 service 和 CLI 注册
 - 回退引擎和 API 实现：[`dist/plugin.js`](./dist/plugin.js)
 - 对外导出入口：[`dist/index.js`](./dist/index.js)
@@ -33,7 +33,7 @@
 
 - 每次 tool 调用前自动创建 checkpoint
 - checkpoint 注册与查询
-- 工作区 snapshot 恢复
+- 基于 Git 的工作区快照恢复，目录级快照仓库存放在 `checkpointDir/_git`
 - rollback 状态跟踪
 - 支持带可选 prompt 的 continue
 - rollback 报告记录
@@ -247,6 +247,9 @@ openclaw plugins doctor
 ```json
 {
   "plugins": {
+    "allow": [
+      "step-rollback"
+    ],
     "enabled": true,
     "entries": {
       "step-rollback": {
@@ -270,6 +273,12 @@ openclaw plugins doctor
 }
 ```
 
+加上 `plugins.allow: ["step-rollback"]` 之后，可以去掉启动时这类 warning：
+
+```text
+plugins.allow is empty; discovered non-bundled plugins may auto-load ...
+```
+
 ### 6. 重启 Gateway
 
 如果 Gateway 以服务方式运行：
@@ -284,7 +293,29 @@ openclaw gateway restart
 openclaw gateway run
 ```
 
+重要：checkpoint 只会为“当前这个插件版本已经加载之后”发生的 tool 调用创建。更新插件代码后，请先重启 Gateway，再启动一个新的 session 进行回退测试。
+
 ### 7. 验证原生 RPC 接口
+
+插件现在已经提供了更友好的 CLI 命令，正常使用时不需要再手写 JSON 参数。
+
+列出 agents：
+
+```bash
+openclaw steprollback agents
+```
+
+按 agent 列出 sessions：
+
+```bash
+openclaw steprollback sessions --agent main
+```
+
+session 列表会按最近更新时间倒序排列，时间会显示为可读格式，并且最新的一条会标记为 `latest`。
+
+如果你仍然希望拿到机器可读的原始输出，可以在任意插件命令后加上 `--json`。
+
+当然，如果你确实想直接调用原始 Gateway RPC，也仍然可以：
 
 ```bash
 openclaw gateway call steprollback.status
@@ -296,36 +327,61 @@ openclaw gateway call steprollback.rollback.status --params '{"agentId":"main","
 
 1. 正常启动 OpenClaw 任务。
 2. 让 agent 执行工具调用。
-3. 查询 checkpoint 列表：
+3. 如果你需要先确认有哪些 agent，可以先执行：
 
 ```bash
-openclaw gateway call steprollback.checkpoints.list --params '{"agentId":"main","sessionId":"<session-id>"}'
+openclaw steprollback agents
 ```
 
-4. 执行回退：
+4. 查看某个 agent 下的 sessions：
 
 ```bash
-openclaw gateway call steprollback.rollback --params '{"agentId":"main","sessionId":"<session-id>","checkpointId":"<checkpoint-id>"}'
+openclaw steprollback sessions --agent main
 ```
 
-5. 确认 session 正在等待 continue：
+5. 查询 checkpoint 列表：
 
 ```bash
-openclaw gateway call steprollback.rollback.status --params '{"agentId":"main","sessionId":"<session-id>"}'
+openclaw steprollback checkpoints --agent main --session <session-id>
 ```
 
-6. 继续执行。
+如果这里仍然显示 `No checkpoints were found`，请优先检查：
+
+1. 这个 session 是否是在最近一次插件重启之后新建的。
+2. 这个 session 是否真的执行过一个或多个 tool 调用。
+3. `plugins.allow` 是否包含 `step-rollback`。
+4. 修改代码后是否已经重启 Gateway。
+5. 你检查的是不是“Git 快照版本插件加载之后”新产生并真正执行过 tool 的 session。
+
+当 checkpoint 正常创建时，插件会把内容放在：
+
+- `~/.openclaw/plugins/step-rollback/checkpoints/`：checkpoint 清单和运行时状态
+- `~/.openclaw/plugins/step-rollback/checkpoints/_git/`：每个 workspace root 对应的 Git 快照仓库
+
+6. 执行回退：
+
+```bash
+openclaw steprollback rollback --agent main --session <session-id> --checkpoint <checkpoint-id>
+```
+
+7. 确认 session 正在等待 continue：
+
+```bash
+openclaw steprollback rollback-status --agent main --session <session-id>
+```
+
+8. 继续执行。
 
 不带 prompt：
 
 ```bash
-openclaw gateway call steprollback.continue --params '{"agentId":"main","sessionId":"<session-id>"}'
+openclaw steprollback continue --agent main --session <session-id>
 ```
 
 带 prompt：
 
 ```bash
-openclaw gateway call steprollback.continue --params '{"agentId":"main","sessionId":"<session-id>","prompt":"Continue from here, but inspect dependencies first."}'
+openclaw steprollback continue --agent main --session <session-id> --prompt "Continue from here, but inspect dependencies first."
 ```
 
 ### 9. 使用 checkout 流程
@@ -333,19 +389,19 @@ openclaw gateway call steprollback.continue --params '{"agentId":"main","session
 列出可 checkout 的节点：
 
 ```bash
-openclaw gateway call steprollback.session.nodes.list --params '{"agentId":"main","sessionId":"<session-id>"}'
+openclaw steprollback nodes --agent main --session <session-id>
 ```
 
 基于节点创建新 session：
 
 ```bash
-openclaw gateway call steprollback.session.checkout --params '{"agentId":"main","sourceSessionId":"<session-id>","sourceEntryId":"<entry-id>","continueAfterCheckout":true,"prompt":"Continue on a new branch from here."}'
+openclaw steprollback checkout --agent main --source-session <session-id> --entry <entry-id> --continue --prompt "Continue on a new branch from here."
 ```
 
 查询 branch record：
 
 ```bash
-openclaw gateway call steprollback.session.branch.get --params '{"branchId":"<branch-id>"}'
+openclaw steprollback branch --branch <branch-id>
 ```
 
 ## 剩余注意事项

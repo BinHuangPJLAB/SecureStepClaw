@@ -13,7 +13,7 @@ What is already here:
 - the plugin manifest: [`openclaw.plugin.json`](./openclaw.plugin.json)
 - the native plugin runtime with `register(api)`: [`dist/native-plugin.js`](./dist/native-plugin.js)
 - Gateway RPC method registration via `api.registerGatewayMethod(...)`
-- typed lifecycle hook registration via `api.on(...)`
+- typed lifecycle hook registration via documented `api.on(...)`, with `api.registerHook(...)` compatibility fallback
 - plugin service and CLI registration
 - the rollback engine and API implementation: [`dist/plugin.js`](./dist/plugin.js)
 - the public entry exports: [`dist/index.js`](./dist/index.js)
@@ -32,7 +32,7 @@ Known caveats:
 
 - automatic checkpoint creation before each tool call
 - checkpoint registry and lookup
-- workspace snapshot restore
+- Git-backed workspace snapshot restore for directory roots, stored under `checkpointDir/_git`
 - rollback status tracking
 - continue with an optional prompt
 - rollback reports
@@ -246,6 +246,9 @@ Update your OpenClaw config so `step-rollback` is enabled and uses real paths fo
 ```json
 {
   "plugins": {
+    "allow": [
+      "step-rollback"
+    ],
     "enabled": true,
     "entries": {
       "step-rollback": {
@@ -269,6 +272,12 @@ Update your OpenClaw config so `step-rollback` is enabled and uses real paths fo
 }
 ```
 
+Adding `plugins.allow: ["step-rollback"]` removes the startup warning:
+
+```text
+plugins.allow is empty; discovered non-bundled plugins may auto-load ...
+```
+
 ### 6. Restart Gateway
 
 If you run Gateway as a service:
@@ -283,7 +292,29 @@ If you run Gateway in the foreground:
 openclaw gateway run
 ```
 
+Important: checkpoints are only created for tool calls that happen after the plugin version is loaded. After updating the plugin, restart Gateway and start a new session before testing rollback.
+
 ### 7. Verify the native RPC surface
+
+The plugin now exposes user-friendly CLI commands, so you do not need to pass raw JSON for the normal workflow.
+
+List agents:
+
+```bash
+openclaw steprollback agents
+```
+
+List sessions for an agent:
+
+```bash
+openclaw steprollback sessions --agent main
+```
+
+The session list is sorted by most recently updated session first, shows readable timestamps, and marks the newest row as `latest`.
+
+If you still want machine-readable output, add `--json` to any plugin CLI command.
+
+You can still use raw Gateway RPC calls if needed:
 
 ```bash
 openclaw gateway call steprollback.status
@@ -295,36 +326,61 @@ openclaw gateway call steprollback.rollback.status --params '{"agentId":"main","
 
 1. Start a normal OpenClaw task.
 2. Let the agent execute tools.
-3. Query checkpoints:
+3. List agents if you need to discover the available agent ids:
 
 ```bash
-openclaw gateway call steprollback.checkpoints.list --params '{"agentId":"main","sessionId":"<session-id>"}'
+openclaw steprollback agents
 ```
 
-4. Roll back to a checkpoint:
+4. List sessions for an agent:
 
 ```bash
-openclaw gateway call steprollback.rollback --params '{"agentId":"main","sessionId":"<session-id>","checkpointId":"<checkpoint-id>"}'
+openclaw steprollback sessions --agent main
 ```
 
-5. Confirm the session is waiting for continue:
+5. Query checkpoints:
 
 ```bash
-openclaw gateway call steprollback.rollback.status --params '{"agentId":"main","sessionId":"<session-id>"}'
+openclaw steprollback checkpoints --agent main --session <session-id>
 ```
 
-6. Continue execution.
+If this prints `No checkpoints were found`, check these first:
+
+1. The session was created after the latest plugin restart.
+2. The session actually executed one or more tool calls.
+3. `plugins.allow` includes `step-rollback`.
+4. The plugin was restarted after code changes.
+5. You are checking a fresh session that produced tool calls after the Git-backed checkpoint build was loaded.
+
+When checkpoints are being created correctly, the plugin stores:
+
+- checkpoint manifests and runtime state under `~/.openclaw/plugins/step-rollback/checkpoints/`
+- Git snapshot repositories for each workspace root under `~/.openclaw/plugins/step-rollback/checkpoints/_git/`
+
+6. Roll back to a checkpoint:
+
+```bash
+openclaw steprollback rollback --agent main --session <session-id> --checkpoint <checkpoint-id>
+```
+
+7. Confirm the session is waiting for continue:
+
+```bash
+openclaw steprollback rollback-status --agent main --session <session-id>
+```
+
+8. Continue execution.
 
 Without a prompt:
 
 ```bash
-openclaw gateway call steprollback.continue --params '{"agentId":"main","sessionId":"<session-id>"}'
+openclaw steprollback continue --agent main --session <session-id>
 ```
 
 With a prompt:
 
 ```bash
-openclaw gateway call steprollback.continue --params '{"agentId":"main","sessionId":"<session-id>","prompt":"Continue from here, but inspect dependencies first."}'
+openclaw steprollback continue --agent main --session <session-id> --prompt "Continue from here, but inspect dependencies first."
 ```
 
 ### 9. Use the checkout flow
@@ -332,19 +388,19 @@ openclaw gateway call steprollback.continue --params '{"agentId":"main","session
 List checkpoint-backed nodes:
 
 ```bash
-openclaw gateway call steprollback.session.nodes.list --params '{"agentId":"main","sessionId":"<session-id>"}'
+openclaw steprollback nodes --agent main --session <session-id>
 ```
 
 Create a new session from a node:
 
 ```bash
-openclaw gateway call steprollback.session.checkout --params '{"agentId":"main","sourceSessionId":"<session-id>","sourceEntryId":"<entry-id>","continueAfterCheckout":true,"prompt":"Continue on a new branch from here."}'
+openclaw steprollback checkout --agent main --source-session <session-id> --entry <entry-id> --continue --prompt "Continue on a new branch from here."
 ```
 
 Look up the branch record:
 
 ```bash
-openclaw gateway call steprollback.session.branch.get --params '{"branchId":"<branch-id>"}'
+openclaw steprollback branch --branch <branch-id>
 ```
 
 ## Remaining caveats
