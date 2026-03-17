@@ -4,7 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { createStepRollbackPlugin } from "../dist/index.js";
+import nativeStepRollbackPlugin, {
+  createNativeStepRollbackPlugin,
+  createStepRollbackPlugin
+} from "../dist/index.js";
 
 async function createFixture() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "secure-step-claw-"));
@@ -257,4 +260,220 @@ test("checks out a session branch from a checkpoint entry", async () => {
 
   assert.equal(nodes.nodes.length, 2);
   assert.equal(nodes.nodes[0].checkoutAvailable, true);
+});
+
+test("registers a native OpenClaw plugin and drives rollback through registered hooks and Gateway methods", async () => {
+  const fixture = await createFixture();
+  const registered = {
+    methods: new Map(),
+    hooks: new Map(),
+    services: [],
+    clis: []
+  };
+  const gatewayCalls = [];
+  const logs = [];
+
+  await fs.writeFile(path.join(fixture.workspace, "native.txt"), "safe\n", "utf8");
+
+  const api = {
+    config: {
+      plugins: {
+        entries: {
+          "step-rollback": {
+            enabled: true,
+            config: {
+              workspaceRoots: [fixture.workspace],
+              checkpointDir: fixture.checkpointDir,
+              registryDir: fixture.registryDir,
+              runtimeDir: fixture.runtimeDir,
+              reportsDir: fixture.reportsDir
+            }
+          }
+        }
+      }
+    },
+    logger: {
+      info(message) {
+        logs.push({ level: "info", message });
+      },
+      warn(message) {
+        logs.push({ level: "warn", message });
+      },
+      error(message) {
+        logs.push({ level: "error", message });
+      },
+      debug(message) {
+        logs.push({ level: "debug", message });
+      }
+    },
+    registerGatewayMethod(name, handler) {
+      registered.methods.set(name, handler);
+    },
+    on(name, handler, options) {
+      registered.hooks.set(name, { handler, options });
+    },
+    registerService(service) {
+      registered.services.push(service);
+    },
+    registerCli(factory, meta) {
+      registered.clis.push({ factory, meta });
+    },
+    runtime: {
+      gateway: {
+        async call(method, params) {
+          gatewayCalls.push({ method, params });
+
+          if (method === "agent" && params.message === "/stop") {
+            return { runId: "stop-run", acceptedAt: "2026-03-17T00:00:00.000Z" };
+          }
+
+          if (method === "agent") {
+            return {
+              runId: `run:${params.sessionId}:${params.resumeFromEntryId ?? "tail"}`,
+              acceptedAt: "2026-03-17T00:00:01.000Z"
+            };
+          }
+
+          return undefined;
+        }
+      }
+    }
+  };
+
+  const nativePlugin = createNativeStepRollbackPlugin();
+  const engine = await nativePlugin.register(api);
+
+  assert.equal(nativeStepRollbackPlugin.id, "step-rollback");
+  assert.equal(engine.manifest.id, "step-rollback");
+  assert.equal(registered.methods.has("steprollback.status"), true);
+  assert.equal(registered.methods.has("steprollback.rollback"), true);
+  assert.equal(registered.hooks.has("session_start"), true);
+  assert.equal(registered.hooks.has("before_tool_call"), true);
+  assert.equal(registered.services.length, 1);
+  assert.equal(registered.clis.length, 1);
+  assert.deepEqual(registered.clis[0].meta.commands, ["steprollback"]);
+
+  const serviceStartResult = await registered.services[0].start();
+  assert.equal(serviceStartResult.pluginId, "step-rollback");
+
+  await registered.hooks.get("session_start").handler({
+    agentId: "main",
+    sessionId: "native-session",
+    runId: "run-native"
+  });
+
+  await registered.hooks.get("before_tool_call").handler({
+    agentId: "main",
+    sessionId: "native-session",
+    entryId: "entry-native",
+    nodeIndex: 1,
+    toolName: "write",
+    runId: "run-native"
+  });
+
+  await fs.writeFile(path.join(fixture.workspace, "native.txt"), "broken\n", "utf8");
+
+  const checkpointResponses = [];
+  await registered.methods.get("steprollback.checkpoints.list")({
+    params: {
+      agentId: "main",
+      sessionId: "native-session"
+    },
+    respond(ok, payload) {
+      checkpointResponses.push({ ok, payload });
+    }
+  });
+
+  assert.equal(checkpointResponses.length, 1);
+  assert.equal(checkpointResponses[0].ok, true);
+  assert.equal(checkpointResponses[0].payload.checkpoints.length, 1);
+
+  const checkpointId = checkpointResponses[0].payload.checkpoints[0].checkpointId;
+
+  const rollbackResponse = await registered.methods.get("steprollback.rollback")({
+    params: {
+      agentId: "main",
+      sessionId: "native-session",
+      checkpointId
+    }
+  });
+
+  assert.equal(rollbackResponse.result, "success");
+  assert.equal(await fs.readFile(path.join(fixture.workspace, "native.txt"), "utf8"), "safe\n");
+  assert.equal(
+    gatewayCalls.some((call) => call.method === "agent" && call.params.message === "/stop"),
+    true
+  );
+
+  const continueResponse = await registered.methods.get("steprollback.continue")({
+    params: {
+      agentId: "main",
+      sessionId: "native-session"
+    }
+  });
+
+  assert.equal(continueResponse.continued, true);
+  assert.equal(
+    gatewayCalls.some(
+      (call) =>
+        call.method === "agent" &&
+        call.params.sessionId === "native-session" &&
+        call.params.message === "Continue from the restored checkpoint."
+    ),
+    true
+  );
+  assert.equal(logs.some((entry) => entry.message.includes("registered native OpenClaw plugin surfaces")), true);
+});
+
+test("returns Gateway-style error payloads for native RPC handlers", async () => {
+  const fixture = await createFixture();
+  const registered = new Map();
+
+  const api = {
+    config: {
+      plugins: {
+        entries: {
+          "step-rollback": {
+            config: {
+              workspaceRoots: [fixture.workspace],
+              checkpointDir: fixture.checkpointDir,
+              registryDir: fixture.registryDir,
+              runtimeDir: fixture.runtimeDir,
+              reportsDir: fixture.reportsDir
+            }
+          }
+        }
+      }
+    },
+    logger: {
+      info() {},
+      warn() {},
+      error() {},
+      debug() {}
+    },
+    registerGatewayMethod(name, handler) {
+      registered.set(name, handler);
+    },
+    on() {},
+    registerService() {},
+    registerCli() {}
+  };
+
+  await createNativeStepRollbackPlugin().register(api);
+
+  const responses = [];
+  await registered.get("steprollback.rollback")({
+    params: {
+      agentId: "main",
+      sessionId: "missing-session",
+      checkpointId: "missing-checkpoint"
+    },
+    respond(ok, payload) {
+      responses.push({ ok, payload });
+    }
+  });
+
+  assert.equal(responses.length, 1);
+  assert.equal(responses[0].ok, false);
+  assert.equal(responses[0].payload.code, "CHECKPOINT_NOT_FOUND");
 });

@@ -2,39 +2,30 @@
 
 英文版文档：[`README.md`](./README.md)
 
-`SecureStepClaw` 是基于 [`docs/`](./docs) 中设计文档实现的一个本地 `step-rollback` 插件原型。它已经包含了回退引擎、存储结构、插件清单以及测试代码，对应项目文档里定义的 Phase 1 和 Phase 2 API 形态。
+`SecureStepClaw` 是基于 [`docs/`](./docs) 中设计文档实现的一个 OpenClaw Native Plugin 版本的 `step-rollback` 插件。它已经包含了原生运行时入口、回退引擎、存储结构、插件清单以及测试代码，对应项目文档里定义的 Phase 1 和 Phase 2 API 形态。
 
 ## 当前状态
 
-这个仓库已经非常接近一个可用的 OpenClaw Native Plugin，但它目前还不是一个可以直接放进 OpenClaw Gateway 就立即生效的完整插件。
+这个仓库现在已经从 [`dist/index.js`](./dist/index.js) 导出了 OpenClaw Native Plugin 运行时入口，原生注册逻辑位于 [`dist/native-plugin.js`](./dist/native-plugin.js)。
 
 目前已经具备的内容：
 
 - 插件清单文件：[`openclaw.plugin.json`](./openclaw.plugin.json)
+- 原生插件运行时入口 `register(api)`：[`dist/native-plugin.js`](./dist/native-plugin.js)
+- 通过 `api.registerGatewayMethod(...)` 注册 Gateway RPC 方法
+- 通过 `api.on(...)` 注册生命周期 hook
+- 插件 service 和 CLI 注册
 - 回退引擎和 API 实现：[`dist/plugin.js`](./dist/plugin.js)
 - 对外导出入口：[`dist/index.js`](./dist/index.js)
 - 本地测试：[`tests/plugin.test.js`](./tests/plugin.test.js)
 
-距离真正接入 OpenClaw 还缺少的部分：
+当前需要注意的点：
 
-- 一个符合 OpenClaw Native Plugin 规范的运行时适配层，并导出 `register(api)`
-- 将 OpenClaw 的 hook 事件接到这个回退引擎上，例如：
-  - `before_tool_call`
-  - `after_tool_call`
-  - `session_start`
-  - `session_end`
-- 一个真正连接 OpenClaw 运行时的 host bridge，用来完成：
-  - rollback 前停止当前 run
-  - 从回退点继续执行
-  - checkout 时创建新 session
-
-因此，这个仓库目前最准确的定位是：
-
-- 一个已经可测试的 rollback 引擎
-- 一个与 `docs/` 中 API 设计保持一致的参考实现
-- 一个后续可以包进 OpenClaw SDK 适配层的核心实现
-
-所以它还不应该被描述成“现在就可以直接安装到 OpenClaw 里并投入生产使用”的完整插件。
+- 我没有在这个工作区里连接真实的 OpenClaw Gateway 进程做联调验证，所以原生桥接层目前是通过 mock OpenClaw API 测试的。
+- 官方文档对 Native Plugin 注册面描述得比较清楚，但并没有给出一个专门的“从同一个 session 的历史 entry 精确恢复继续执行”的公开运行时 helper。
+- 因此，插件在 [`dist/native-plugin.js`](./dist/native-plugin.js) 中采用了“官方原生接口 + best-effort runtime bridge”的实现方式。
+- 如果你本地使用的 OpenClaw 版本在 `api.runtime` 下暴露的方法名不同，可能需要对 [`dist/native-plugin.js`](./dist/native-plugin.js) 做一小段兼容调整。
+- 当 `steprollback.continue` 没有传入 prompt 时，插件会自动补一条 `Continue from the restored checkpoint.`，因为 OpenClaw 的 `agent` 入口需要消息文本。
 
 ## 已实现内容
 
@@ -59,6 +50,7 @@
 - [`openclaw.plugin.json`](./openclaw.plugin.json)：插件 manifest 与配置 schema
 - [`package.json`](./package.json)：包信息与测试脚本
 - [`dist/index.js`](./dist/index.js)：公共导出入口
+- [`dist/native-plugin.js`](./dist/native-plugin.js)：OpenClaw 原生运行时入口与注册逻辑
 - [`dist/plugin.js`](./dist/plugin.js)：核心插件引擎
 - [`dist/services/`](./dist/services)：checkpoint、registry、runtime、lock、report 等服务
 - [`tests/plugin.test.js`](./tests/plugin.test.js)：Node 测试套件
@@ -80,7 +72,7 @@
 
 ## 本地开发使用流程
 
-这是当前仓库在“还没有 OpenClaw 原生适配层”情况下，今天就能使用的方式。
+如果你想在不启动真实 OpenClaw Gateway 的情况下，直接在代码里调试 rollback 引擎，可以按下面的方式使用。
 
 ### 1. 进入项目目录
 
@@ -98,7 +90,7 @@ npm test
 
 ### 3. 在代码中创建 rollback 引擎实例
 
-当前入口是一个 JavaScript API，并不是 OpenClaw 的 `register(api)` 运行时入口。
+除了原生 OpenClaw 运行时入口之外，这个仓库也同时暴露了一个普通 JavaScript API，便于本地直接测试回退引擎。
 
 ```js
 import crypto from "node:crypto";
@@ -210,68 +202,37 @@ const resumed = await plugin.methods["steprollback.continue"]({
 
 ## 如何把它安装到 OpenClaw
 
-这一部分分成两个层次：
+### 1. 把仓库放在 Gateway 所在机器上
 
-1. 当前这个仓库今天能做什么
-2. 等补上 OpenClaw 原生适配层之后，真正的安装步骤会是什么样
+这个插件会运行在 OpenClaw Gateway 进程内，所以请把仓库放在真正运行 Gateway 的机器上。
 
-### 当前阶段：先本地验证引擎
+### 2. 先验证本地包
 
-1. 把这个仓库放在运行 OpenClaw Gateway 的同一台机器上。
-2. 在项目目录执行 `npm test`。
-3. 规划好插件状态目录存放位置。
-4. 明确你的 OpenClaw workspace 路径，因为这个插件恢复的就是这个工作区。
-5. 如果你希望提前规范 OpenClaw 配置，也可以现在就先准备未来要使用的配置项。
-
-建议的未来 OpenClaw 配置如下：
-
-```json
-{
-  "plugins": {
-    "enabled": true,
-    "entries": {
-      "step-rollback": {
-        "enabled": true,
-        "config": {
-          "enabled": true,
-          "workspaceRoots": [
-            "/Users/you/.openclaw/workspace"
-          ],
-          "checkpointDir": "/Users/you/.openclaw/plugins/step-rollback/checkpoints",
-          "registryDir": "/Users/you/.openclaw/plugins/step-rollback/registry",
-          "runtimeDir": "/Users/you/.openclaw/plugins/step-rollback/runtime",
-          "reportsDir": "/Users/you/.openclaw/plugins/step-rollback/reports",
-          "maxCheckpointsPerSession": 100,
-          "allowContinuePrompt": true,
-          "stopRunBeforeRollback": true
-        }
-      }
-    }
-  }
-}
+```bash
+cd /Users/bin-mac/CodeX/SecureStepClaw
+npm test
 ```
 
-### 补上 OpenClaw 原生适配层之后
+### 3. 安装插件
 
-当这个仓库真正导出 OpenClaw 规范的 `register(api)` 入口后，安装步骤就可以按下面的方式执行。
-
-#### 方式 A：开发阶段用软链接安装
+开发阶段建议使用软链接安装：
 
 ```bash
 openclaw plugins install -l /Users/bin-mac/CodeX/SecureStepClaw
 ```
 
-适合在开发过程中直接让 OpenClaw 加载当前工作目录，而不是复制一份文件。
-
-#### 方式 B：本地复制安装
+如果你希望复制安装：
 
 ```bash
 openclaw plugins install /Users/bin-mac/CodeX/SecureStepClaw
 ```
 
-适合把插件复制到 OpenClaw 管理的插件目录中。
+这个仓库通过以下两个位置声明了原生插件入口：
 
-#### 验证插件是否安装成功
+- [`openclaw.plugin.json`](./openclaw.plugin.json)
+- [`package.json`](./package.json) 中的 `openclaw.extensions`
+
+### 4. 验证是否安装成功
 
 ```bash
 openclaw plugins list
@@ -279,9 +240,9 @@ openclaw plugins info step-rollback
 openclaw plugins doctor
 ```
 
-#### 配置插件
+### 5. 配置插件
 
-在 OpenClaw 配置文件中启用 `step-rollback`，并填写明确的目录路径：
+在 OpenClaw 配置中启用 `step-rollback`，并填写真实的工作区与插件状态目录：
 
 ```json
 {
@@ -309,23 +270,21 @@ openclaw plugins doctor
 }
 ```
 
-#### 重启 Gateway
+### 6. 重启 Gateway
 
-如果你以服务方式运行 Gateway：
+如果 Gateway 以服务方式运行：
 
 ```bash
 openclaw gateway restart
 ```
 
-如果你在前台手动运行 Gateway：
+如果 Gateway 在前台运行：
 
 ```bash
 openclaw gateway run
 ```
 
-#### 验证 RPC 接口
-
-等原生适配层补齐并且插件真正接入 Gateway 之后，下面这些命令应该可以工作：
+### 7. 验证原生 RPC 接口
 
 ```bash
 openclaw gateway call steprollback.status
@@ -333,29 +292,29 @@ openclaw gateway call steprollback.checkpoints.list --params '{"agentId":"main",
 openclaw gateway call steprollback.rollback.status --params '{"agentId":"main","sessionId":"<session-id>"}'
 ```
 
-#### 在 OpenClaw 中使用 rollback 流程
+### 8. 使用 rollback 流程
 
-1. 正常启动一个 OpenClaw 任务。
+1. 正常启动 OpenClaw 任务。
 2. 让 agent 执行工具调用。
-3. 查询当前 session 的 checkpoint 列表：
+3. 查询 checkpoint 列表：
 
 ```bash
 openclaw gateway call steprollback.checkpoints.list --params '{"agentId":"main","sessionId":"<session-id>"}'
 ```
 
-4. 选中一个 checkpoint 并执行回退：
+4. 执行回退：
 
 ```bash
 openclaw gateway call steprollback.rollback --params '{"agentId":"main","sessionId":"<session-id>","checkpointId":"<checkpoint-id>"}'
 ```
 
-5. 确认 session 已进入等待 continue 状态：
+5. 确认 session 正在等待 continue：
 
 ```bash
 openclaw gateway call steprollback.rollback.status --params '{"agentId":"main","sessionId":"<session-id>"}'
 ```
 
-6. 从回退点继续执行。
+6. 继续执行。
 
 不带 prompt：
 
@@ -369,15 +328,15 @@ openclaw gateway call steprollback.continue --params '{"agentId":"main","session
 openclaw gateway call steprollback.continue --params '{"agentId":"main","sessionId":"<session-id>","prompt":"Continue from here, but inspect dependencies first."}'
 ```
 
-#### 使用 checkout 流程
+### 9. 使用 checkout 流程
 
-列出可 checkout 的 checkpoint 节点：
+列出可 checkout 的节点：
 
 ```bash
 openclaw gateway call steprollback.session.nodes.list --params '{"agentId":"main","sessionId":"<session-id>"}'
 ```
 
-基于某个节点创建新 session：
+基于节点创建新 session：
 
 ```bash
 openclaw gateway call steprollback.session.checkout --params '{"agentId":"main","sourceSessionId":"<session-id>","sourceEntryId":"<entry-id>","continueAfterCheckout":true,"prompt":"Continue on a new branch from here."}'
@@ -389,19 +348,14 @@ openclaw gateway call steprollback.session.checkout --params '{"agentId":"main",
 openclaw gateway call steprollback.session.branch.get --params '{"branchId":"<branch-id>"}'
 ```
 
-## 还需要补什么
+## 剩余注意事项
 
-要让上面“补上 OpenClaw 原生适配层之后”的说明真正变成可执行安装流程，下一步代码工作主要包括：
+目前主要有以下几点需要注意：
 
-1. 在运行时入口导出原生 OpenClaw 插件对象或默认函数
-2. 使用 `api.registerGatewayMethod(...)` 注册 `steprollback.*` 方法
-3. 使用 `api.on(...)` 连接 OpenClaw 生命周期 hook
-4. 把 OpenClaw 的真实运行时能力接到以下 bridge 上：
-   - `stopRun`
-   - `startContinueRun`
-   - `createSession`
-
-只要这个适配层完成，上面的安装与使用步骤就能成为真正可运行的生产流程。
+1. 原生注册路径已经实现并通过 mock OpenClaw API 测试，但还没有在这个仓库里连接真实 Gateway 二进制做联调。
+2. 官方插件文档没有明确给出一个“从历史 entry 精确恢复同一 session 执行”的专门 runtime helper。
+3. 因此，插件在 [`dist/native-plugin.js`](./dist/native-plugin.js) 中采用了“原生注册 + best-effort runtime bridge”的做法，必要时会调用 Gateway 的 `agent` 入口。
+4. 如果你本地的 OpenClaw 版本暴露的 runtime helper 名称不同，请调整 [`dist/native-plugin.js`](./dist/native-plugin.js) 中的 helper lookup。
 
 ## 验证方式
 

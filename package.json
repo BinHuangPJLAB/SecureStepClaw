@@ -2,12 +2,17 @@
   "name": "secure-step-claw",
   "version": "0.1.0",
   "private": true,
-  "description": "OpenClaw step rollback plugin prototype built from the project docs.",
+  "description": "OpenClaw native step rollback plugin built from the project docs.",
   "type": "module",
   "main": "./dist/index.js",
   "exports": "./dist/index.js",
   "scripts": {
     "test": "node --test"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
   },
   "engines": {
     "node": ">=24"
