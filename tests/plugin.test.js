@@ -117,7 +117,7 @@ test("creates checkpoints, rolls back workspace state, and continues from the ch
     runId: "run-1"
   });
 
-  await plugin.hooks.beforeToolCall({
+  const firstCheckpoint = await plugin.hooks.beforeToolCall({
     agentId: "main",
     sessionId: "session-1",
     entryId: "entry-1",
@@ -125,6 +125,10 @@ test("creates checkpoints, rolls back workspace state, and continues from the ch
     toolName: "write",
     runId: "run-1"
   });
+
+  assert.equal(firstCheckpoint.workspaceSnapshots[0].backend, "git");
+  assert.equal(firstCheckpoint.workspaceSnapshots[0].targetPath, fixture.workspace);
+  assert.match(firstCheckpoint.workspaceSnapshots[0].commitId, /^[0-9a-f]{40}$/);
 
   await fs.writeFile(path.join(fixture.workspace, "app.txt"), "v2\n", "utf8");
 
@@ -187,6 +191,28 @@ test("creates checkpoints, rolls back workspace state, and continues from the ch
   const finalState = await plugin.services.runtimeCursorManager.get("main", "session-1");
   assert.equal(finalState.awaitingContinue, false);
   assert.equal(finalState.currentRunId, "continued:session-1:entry-1");
+});
+
+test("repairs placeholder home paths in plugin config", async () => {
+  const plugin = createStepRollbackPlugin({
+    config: {
+      workspaceRoots: ["/Users/you/.openclaw/workspace"],
+      checkpointDir: "/Users/you/.openclaw/plugins/step-rollback/checkpoints",
+      registryDir: "/Users/you/.openclaw/plugins/step-rollback/registry",
+      runtimeDir: "/Users/you/.openclaw/plugins/step-rollback/runtime",
+      reportsDir: "/Users/you/.openclaw/plugins/step-rollback/reports"
+    }
+  });
+
+  assert.equal(plugin.config.workspaceRoots[0], path.join(os.homedir(), ".openclaw", "workspace"));
+  assert.equal(
+    plugin.config.checkpointDir,
+    path.join(os.homedir(), ".openclaw", "plugins", "step-rollback", "checkpoints")
+  );
+  assert.equal(
+    plugin.config.registryDir,
+    path.join(os.homedir(), ".openclaw", "plugins", "step-rollback", "registry")
+  );
 });
 
 test("prunes old checkpoints when maxCheckpointsPerSession is exceeded", async () => {

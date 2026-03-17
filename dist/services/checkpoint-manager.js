@@ -20,17 +20,26 @@ import {
 const execFileAsync = promisify(execFile);
 
 export class CheckpointManager {
-  constructor({ config, registry, runtimeCursorManager, sequenceStore }) {
+  constructor({ config, registry, runtimeCursorManager, sequenceStore, logger }) {
     this.config = config;
     this.registry = registry;
     this.runtimeCursorManager = runtimeCursorManager;
     this.sequenceStore = sequenceStore;
+    this.logger = logger ?? {
+      info() {},
+      warn() {},
+      error() {},
+      debug() {}
+    };
   }
 
   async create(ctx) {
     const checkpointId = await this.sequenceStore.next("ckpt");
     const snapshotRoot = path.join(this.config.checkpointDir, checkpointId);
     const createdAt = nowIso();
+    this.logger.info(
+      `[step-rollback] checkpoint create start checkpoint='${checkpointId}' session='${ctx.sessionId}' tool='${ctx.toolName}'`
+    );
 
     const runtimeState = await this.runtimeCursorManager.ensure(ctx.agentId, ctx.sessionId, {
       activeHeadEntryId: ctx.entryId ?? null,
@@ -65,6 +74,15 @@ export class CheckpointManager {
       toolName: ctx.toolName,
       createdAt,
       snapshotRef: snapshotRoot,
+      workspaceSnapshots: manifest.workspaceEntries.map((entry) => ({
+        targetPath: entry.targetPath,
+        existed: entry.existed,
+        kind: entry.kind,
+        backend: entry.backend,
+        snapshotName: entry.snapshotName ?? null,
+        repoDir: entry.repoDir ?? null,
+        commitId: entry.commitId ?? null
+      })),
       status: "ready",
       summary: `before tool ${ctx.toolName}`
     };
@@ -80,6 +98,10 @@ export class CheckpointManager {
     for (const item of removed) {
       await this.removeArtifacts(item);
     }
+
+    this.logger.info(
+      `[step-rollback] checkpoint create complete checkpoint='${checkpointId}' session='${ctx.sessionId}' snapshotRef='${snapshotRoot}'`
+    );
 
     return record;
   }
@@ -108,6 +130,8 @@ export class CheckpointManager {
       current.status = "restoring";
       return current;
     });
+
+    this.logger.info(`[step-rollback] checkpoint restore start checkpoint='${checkpointId}'`);
 
     try {
       const manifest = await readJson(path.join(record.snapshotRef, "snapshot.json"), null);
@@ -138,6 +162,9 @@ export class CheckpointManager {
         return current;
       });
     } catch (error) {
+      this.logger.error(
+        `[step-rollback] checkpoint restore failed checkpoint='${checkpointId}': ${error instanceof Error ? error.message : error}`
+      );
       await this.registry.update(checkpointId, (current) => {
         current.status = "failed";
         return current;
@@ -176,6 +203,9 @@ export class CheckpointManager {
     const exists = await pathExists(rootPath);
 
     if (!exists) {
+      this.logger.warn(
+        `[step-rollback] workspace root '${rootPath}' did not exist while creating checkpoint '${checkpointId}'`
+      );
       return {
         backend: "git",
         targetPath: rootPath,
@@ -191,6 +221,9 @@ export class CheckpointManager {
     if (stats.isDirectory()) {
       const repoDir = this.gitRepoDir(rootPath);
       const commitId = await this.captureGitSnapshot(repoDir, rootPath, checkpointId, ctx.toolName);
+      this.logger.info(
+        `[step-rollback] git snapshot committed checkpoint='${checkpointId}' root='${rootPath}' commit='${commitId}' repo='${repoDir}'`
+      );
 
       return {
         backend: "git",
@@ -205,6 +238,9 @@ export class CheckpointManager {
     const snapshotName = snapshotEntryName(rootPath);
     const snapshotTarget = path.join(snapshotRoot, "workspace", snapshotName);
     const kind = await copyPath(rootPath, snapshotTarget);
+    this.logger.info(
+      `[step-rollback] copied snapshot checkpoint='${checkpointId}' target='${rootPath}' kind='${kind}'`
+    );
 
     return {
       backend: "copy",
@@ -309,6 +345,7 @@ export class CheckpointManager {
     }
 
     await ensureDir(path.dirname(repoDir));
+    this.logger.info(`[step-rollback] initializing snapshot git repository '${repoDir}'`);
     await this.runGit(["init", "--bare", repoDir], {
       cwd: path.dirname(repoDir)
     });

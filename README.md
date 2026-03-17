@@ -187,12 +187,12 @@ Example config object:
 {
   "enabled": true,
   "workspaceRoots": [
-    "/Users/you/.openclaw/workspace"
+    "~/.openclaw/workspace"
   ],
-  "checkpointDir": "/Users/you/.openclaw/plugins/step-rollback/checkpoints",
-  "registryDir": "/Users/you/.openclaw/plugins/step-rollback/registry",
-  "runtimeDir": "/Users/you/.openclaw/plugins/step-rollback/runtime",
-  "reportsDir": "/Users/you/.openclaw/plugins/step-rollback/reports",
+  "checkpointDir": "~/.openclaw/plugins/step-rollback/checkpoints",
+  "registryDir": "~/.openclaw/plugins/step-rollback/registry",
+  "runtimeDir": "~/.openclaw/plugins/step-rollback/runtime",
+  "reportsDir": "~/.openclaw/plugins/step-rollback/reports",
   "maxCheckpointsPerSession": 100,
   "allowContinuePrompt": true,
   "stopRunBeforeRollback": true
@@ -256,12 +256,12 @@ Update your OpenClaw config so `step-rollback` is enabled and uses real paths fo
         "config": {
           "enabled": true,
           "workspaceRoots": [
-            "/Users/you/.openclaw/workspace"
+            "~/.openclaw/workspace"
           ],
-          "checkpointDir": "/Users/you/.openclaw/plugins/step-rollback/checkpoints",
-          "registryDir": "/Users/you/.openclaw/plugins/step-rollback/registry",
-          "runtimeDir": "/Users/you/.openclaw/plugins/step-rollback/runtime",
-          "reportsDir": "/Users/you/.openclaw/plugins/step-rollback/reports",
+          "checkpointDir": "~/.openclaw/plugins/step-rollback/checkpoints",
+          "registryDir": "~/.openclaw/plugins/step-rollback/registry",
+          "runtimeDir": "~/.openclaw/plugins/step-rollback/runtime",
+          "reportsDir": "~/.openclaw/plugins/step-rollback/reports",
           "maxCheckpointsPerSession": 100,
           "allowContinuePrompt": true,
           "stopRunBeforeRollback": true
@@ -356,6 +356,8 @@ When checkpoints are being created correctly, the plugin stores:
 
 - checkpoint manifests and runtime state under `~/.openclaw/plugins/step-rollback/checkpoints/`
 - Git snapshot repositories for each workspace root under `~/.openclaw/plugins/step-rollback/checkpoints/_git/`
+
+Recent builds also log the resolved plugin config and every `before_tool_call` checkpoint creation attempt. If you still see `/Users/you/...` in your OpenClaw config, the plugin now auto-rewrites that placeholder to your real home directory and emits a warning so it is visible in the terminal.
 
 6. Roll back to a checkpoint:
 

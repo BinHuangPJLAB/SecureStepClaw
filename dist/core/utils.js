@@ -36,8 +36,37 @@ export function expandHomePath(value) {
   return value;
 }
 
+export function isPlaceholderHomePath(value) {
+  if (typeof value !== "string") {
+    return false;
+  }
+
+  return (
+    value === "/Users/you" ||
+    value.startsWith("/Users/you/") ||
+    value === "/home/you" ||
+    value.startsWith("/home/you/")
+  );
+}
+
+export function repairPlaceholderHomePath(value) {
+  if (!isPlaceholderHomePath(value)) {
+    return value;
+  }
+
+  if (value === "/Users/you" || value === "/home/you") {
+    return os.homedir();
+  }
+
+  if (value.startsWith("/Users/you/")) {
+    return path.join(os.homedir(), value.slice("/Users/you/".length));
+  }
+
+  return path.join(os.homedir(), value.slice("/home/you/".length));
+}
+
 export function resolveAbsolutePath(value, cwd = process.cwd()) {
-  const expanded = expandHomePath(value);
+  const expanded = expandHomePath(repairPlaceholderHomePath(value));
   return path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(cwd, expanded);
 }
 

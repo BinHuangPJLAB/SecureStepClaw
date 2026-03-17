@@ -188,12 +188,12 @@ const resumed = await plugin.methods["steprollback.continue"]({
 {
   "enabled": true,
   "workspaceRoots": [
-    "/Users/you/.openclaw/workspace"
+    "~/.openclaw/workspace"
   ],
-  "checkpointDir": "/Users/you/.openclaw/plugins/step-rollback/checkpoints",
-  "registryDir": "/Users/you/.openclaw/plugins/step-rollback/registry",
-  "runtimeDir": "/Users/you/.openclaw/plugins/step-rollback/runtime",
-  "reportsDir": "/Users/you/.openclaw/plugins/step-rollback/reports",
+  "checkpointDir": "~/.openclaw/plugins/step-rollback/checkpoints",
+  "registryDir": "~/.openclaw/plugins/step-rollback/registry",
+  "runtimeDir": "~/.openclaw/plugins/step-rollback/runtime",
+  "reportsDir": "~/.openclaw/plugins/step-rollback/reports",
   "maxCheckpointsPerSession": 100,
   "allowContinuePrompt": true,
   "stopRunBeforeRollback": true
@@ -257,12 +257,12 @@ openclaw plugins doctor
         "config": {
           "enabled": true,
           "workspaceRoots": [
-            "/Users/you/.openclaw/workspace"
+            "~/.openclaw/workspace"
           ],
-          "checkpointDir": "/Users/you/.openclaw/plugins/step-rollback/checkpoints",
-          "registryDir": "/Users/you/.openclaw/plugins/step-rollback/registry",
-          "runtimeDir": "/Users/you/.openclaw/plugins/step-rollback/runtime",
-          "reportsDir": "/Users/you/.openclaw/plugins/step-rollback/reports",
+          "checkpointDir": "~/.openclaw/plugins/step-rollback/checkpoints",
+          "registryDir": "~/.openclaw/plugins/step-rollback/registry",
+          "runtimeDir": "~/.openclaw/plugins/step-rollback/runtime",
+          "reportsDir": "~/.openclaw/plugins/step-rollback/reports",
           "maxCheckpointsPerSession": 100,
           "allowContinuePrompt": true,
           "stopRunBeforeRollback": true
@@ -357,6 +357,8 @@ openclaw steprollback checkpoints --agent main --session <session-id>
 
 - `~/.openclaw/plugins/step-rollback/checkpoints/`：checkpoint 清单和运行时状态
 - `~/.openclaw/plugins/step-rollback/checkpoints/_git/`：每个 workspace root 对应的 Git 快照仓库
+
+最近的版本还会在终端里打印解析后的插件配置，以及每一次 `before_tool_call` 的 checkpoint 创建日志。如果你的 OpenClaw 配置里仍然写着 `/Users/you/...`，插件现在会自动修正为当前用户的 home 目录，并打印 warning 方便排查。
 
 6. 执行回退：
 

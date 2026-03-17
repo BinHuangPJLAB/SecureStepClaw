@@ -65,6 +65,16 @@ export const manifest = {
   }
 };
 
+function createNoopLogger() {
+  const noop = () => {};
+  return {
+    info: noop,
+    warn: noop,
+    error: noop,
+    debug: noop
+  };
+}
+
 function toRollbackStatus(agentId, sessionId, state) {
   return {
     agentId,
@@ -77,11 +87,12 @@ function toRollbackStatus(agentId, sessionId, state) {
 }
 
 export class StepRollbackPlugin {
-  constructor({ config, host, services }) {
+  constructor({ config, host, services, logger }) {
     this.config = config;
     this.host = host;
     this.services = services;
     this.manifest = manifest;
+    this.logger = logger ?? createNoopLogger();
 
     this.hooks = {
       sessionStart: (ctx) => this.sessionStart(ctx),
@@ -117,6 +128,10 @@ export class StepRollbackPlugin {
     ensureCondition(ctx?.agentId, "SESSION_NOT_FOUND", "sessionStart requires agentId.");
     ensureCondition(ctx?.sessionId, "SESSION_NOT_FOUND", "sessionStart requires sessionId.");
 
+    this.logger.info(
+      `[${manifest.id}] session_start agent='${ctx.agentId}' session='${ctx.sessionId}' run='${ctx.runId ?? "-"}'`
+    );
+
     return this.services.runtimeCursorManager.update(
       ctx.agentId,
       ctx.sessionId,
@@ -135,6 +150,9 @@ export class StepRollbackPlugin {
   async sessionEnd(ctx) {
     ensureCondition(ctx?.agentId, "SESSION_NOT_FOUND", "sessionEnd requires agentId.");
     ensureCondition(ctx?.sessionId, "SESSION_NOT_FOUND", "sessionEnd requires sessionId.");
+    this.logger.info(
+      `[${manifest.id}] session_end agent='${ctx.agentId}' session='${ctx.sessionId}' run='${ctx.runId ?? "-"}'`
+    );
     return this.services.runtimeCursorManager.clearCurrentRun(ctx.agentId, ctx.sessionId);
   }
 
@@ -144,6 +162,9 @@ export class StepRollbackPlugin {
     }
 
     this.assertToolContext(ctx, "before_tool_call");
+    this.logger.info(
+      `[${manifest.id}] before_tool_call agent='${ctx.agentId}' session='${ctx.sessionId}' entry='${ctx.entryId}' node='${ctx.nodeIndex}' tool='${ctx.toolName}'`
+    );
 
     await this.services.runtimeCursorManager.update(
       ctx.agentId,
@@ -159,7 +180,11 @@ export class StepRollbackPlugin {
       }
     );
 
-    return this.services.checkpointManager.create(ctx);
+    const checkpoint = await this.services.checkpointManager.create(ctx);
+    this.logger.info(
+      `[${manifest.id}] created checkpoint '${checkpoint.checkpointId}' for session '${ctx.sessionId}' before tool '${ctx.toolName}'`
+    );
+    return checkpoint;
   }
 
   async afterToolCall(ctx) {
@@ -168,6 +193,9 @@ export class StepRollbackPlugin {
     }
 
     this.assertToolContext(ctx, "after_tool_call");
+    this.logger.debug(
+      `[${manifest.id}] after_tool_call agent='${ctx.agentId}' session='${ctx.sessionId}' entry='${ctx.entryId}' node='${ctx.nodeIndex}' tool='${ctx.toolName}'`
+    );
 
     return this.services.runtimeCursorManager.update(
       ctx.agentId,
@@ -216,6 +244,9 @@ export class StepRollbackPlugin {
   async rollback({ agentId, sessionId, checkpointId }) {
     this.assertSessionRequest(agentId, sessionId);
     ensureCondition(checkpointId, "CHECKPOINT_NOT_FOUND", "checkpointId is required.");
+    this.logger.info(
+      `[${manifest.id}] rollback requested agent='${agentId}' session='${sessionId}' checkpoint='${checkpointId}'`
+    );
 
     return this.services.lockManager.withLock(agentId, sessionId, async () => {
       const checkpoint = await this.services.checkpointManager.get(checkpointId);
@@ -285,6 +316,10 @@ export class StepRollbackPlugin {
           message: "rollback completed, waiting for continue"
         });
 
+        this.logger.info(
+          `[${manifest.id}] rollback completed agent='${agentId}' session='${sessionId}' checkpoint='${checkpointId}' rollback='${rollbackId}'`
+        );
+
         return {
           rollbackId,
           agentId,
@@ -301,6 +336,10 @@ export class StepRollbackPlugin {
           sessionId,
           checkpointId
         });
+
+        this.logger.error(
+          `[${manifest.id}] rollback failed agent='${agentId}' session='${sessionId}' checkpoint='${checkpointId}': ${normalizedError.message}`
+        );
 
         rollbackId = rollbackId ?? (await this.services.sequenceStore.next("rb"));
         await this.services.reportWriter.save({
@@ -323,6 +362,9 @@ export class StepRollbackPlugin {
 
   async continue({ agentId, sessionId, prompt }) {
     this.assertSessionRequest(agentId, sessionId);
+    this.logger.info(
+      `[${manifest.id}] continue requested agent='${agentId}' session='${sessionId}' prompt='${prompt ?? "-"}'`
+    );
 
     if (prompt && !this.config.allowContinuePrompt) {
       throw new StepRollbackError(
@@ -366,6 +408,10 @@ export class StepRollbackPlugin {
       prompt,
       runId: runResult?.runId ?? null
     });
+
+    this.logger.info(
+      `[${manifest.id}] continue started agent='${agentId}' session='${sessionId}' run='${runResult?.runId ?? "-"}'`
+    );
 
     return {
       agentId,
@@ -506,6 +552,7 @@ export class StepRollbackPlugin {
 export function createStepRollbackPlugin(options = {}) {
   const config = resolveConfig(options.config);
   const host = createDefaultHostBridge(options.host);
+  const logger = options.logger ?? createNoopLogger();
   const sequenceStore = new SequenceStore(path.join(config.registryDir, "_sequences.json"));
   const runtimeCursorManager = new RuntimeCursorManager({ config });
   const registry = new CheckpointRegistry({ config });
@@ -513,7 +560,8 @@ export function createStepRollbackPlugin(options = {}) {
     config,
     registry,
     runtimeCursorManager,
-    sequenceStore
+    sequenceStore,
+    logger
   });
   const reportWriter = new ReportWriter({ config });
   const lockManager = new SessionLockManager({ config });
@@ -521,6 +569,7 @@ export function createStepRollbackPlugin(options = {}) {
   return new StepRollbackPlugin({
     config,
     host,
+    logger,
     services: {
       sequenceStore,
       runtimeCursorManager,

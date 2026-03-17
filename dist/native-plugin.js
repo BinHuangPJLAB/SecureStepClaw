@@ -1,7 +1,13 @@
 import crypto from "node:crypto";
 
 import { StepRollbackError, toStepRollbackError } from "./core/errors.js";
-import { readJson, resolveAbsolutePath } from "./core/utils.js";
+import {
+  fileExistsSync,
+  isPlaceholderHomePath,
+  readJson,
+  resolveAbsolutePath,
+  resolveConfig
+} from "./core/utils.js";
 import { createStepRollbackPlugin, manifest } from "./plugin.js";
 
 const HOOK_BINDINGS = [
@@ -158,6 +164,60 @@ function resolvePluginConfig(api, pluginId) {
   };
 }
 
+function formatConfigSummary(config) {
+  return JSON.stringify(
+    {
+      enabled: config.enabled,
+      workspaceRoots: config.workspaceRoots,
+      checkpointDir: config.checkpointDir,
+      registryDir: config.registryDir,
+      runtimeDir: config.runtimeDir,
+      reportsDir: config.reportsDir,
+      maxCheckpointsPerSession: config.maxCheckpointsPerSession
+    },
+    null,
+    2
+  );
+}
+
+function findPlaceholderConfigPaths(rawConfig) {
+  const warnings = [];
+
+  for (const rootPath of rawConfig.workspaceRoots ?? []) {
+    if (isPlaceholderHomePath(rootPath)) {
+      warnings.push(`workspaceRoots contains placeholder path '${rootPath}'`);
+    }
+  }
+
+  for (const key of ["checkpointDir", "registryDir", "runtimeDir", "reportsDir"]) {
+    if (isPlaceholderHomePath(rawConfig[key])) {
+      warnings.push(`${key} contains placeholder path '${rawConfig[key]}'`);
+    }
+  }
+
+  return warnings;
+}
+
+function prepareResolvedConfig(rawConfig, logger) {
+  const resolvedConfig = resolveConfig(rawConfig);
+
+  for (const warning of findPlaceholderConfigPaths(rawConfig)) {
+    logger.warn?.(
+      `[${manifest.id}] ${warning}. The plugin will repair it to the current home directory automatically.`
+    );
+  }
+
+  logger.info?.(`[${manifest.id}] resolved config\n${formatConfigSummary(resolvedConfig)}`);
+
+  for (const rootPath of resolvedConfig.workspaceRoots) {
+    if (!fileExistsSync(rootPath)) {
+      logger.warn?.(`[${manifest.id}] configured workspace root does not exist: ${rootPath}`);
+    }
+  }
+
+  return resolvedConfig;
+}
+
 function extractGatewayParams(request) {
   if (!request || typeof request !== "object") {
     return {};
@@ -218,7 +278,13 @@ function normalizeHookContext(kind, event, ctx) {
       ctx?.toolName,
       ctx?.tool?.name
     ),
-    success: pickFirst(event?.success, ctx?.success)
+    success: pickFirst(event?.success, ctx?.success),
+    cwd: pickFirst(
+      event?.cwd,
+      event?.session?.cwd,
+      ctx?.cwd,
+      ctx?.session?.cwd
+    )
   };
 
   if (kind === "session") {
@@ -637,15 +703,21 @@ function registerLifecycleHooks(api, engine, logger) {
       const normalized = normalizeHookContext(binding.kind, event, ctx);
 
       try {
+        logger.info?.(
+          `[${manifest.id}] hook '${binding.hookName}' agent='${normalized.agentId ?? "-"}' session='${normalized.sessionId ?? "-"}' entry='${normalized.entryId ?? "-"}' node='${normalized.nodeIndex ?? "-"}' tool='${normalized.toolName ?? "-"}' cwd='${normalized.cwd ?? "-"}'`
+        );
+
         if (!normalized.agentId || !normalized.sessionId) {
-          logger.debug?.(`[${manifest.id}] Skipping hook '${binding.hookName}' because agent/session ids were missing.`);
+          logger.warn?.(
+            `[${manifest.id}] Skipping hook '${binding.hookName}' because agent/session ids were missing. eventKeys=${Object.keys(event ?? {}).join(",")} ctxKeys=${Object.keys(ctx ?? {}).join(",")}`
+          );
           return null;
         }
 
         if (binding.kind === "tool") {
           if (!normalized.entryId || !Number.isInteger(normalized.nodeIndex) || !normalized.toolName) {
             logger.warn?.(
-              `[${manifest.id}] Skipping hook '${binding.hookName}' because entryId, nodeIndex, or toolName was missing.`
+              `[${manifest.id}] Skipping hook '${binding.hookName}' because entryId, nodeIndex, or toolName was missing. eventKeys=${Object.keys(event ?? {}).join(",")} ctxKeys=${Object.keys(ctx ?? {}).join(",")}`
             );
             return null;
           }
@@ -914,14 +986,16 @@ export function createNativeStepRollbackPlugin(options = {}) {
     id: manifest.id,
     name: manifest.name,
     configSchema: manifest.configSchema,
-    async register(api) {
+    register(api) {
       const logger = createLogger(api);
-      const config = {
+      const rawConfig = {
         ...resolvePluginConfig(api, manifest.id),
         ...(options.config ?? {})
       };
+      const config = prepareResolvedConfig(rawConfig, logger);
       const engine = createStepRollbackPlugin({
         config,
+        logger,
         host: {
           ...createNativeHostBridge(api, logger),
           ...(options.host ?? {})
