@@ -4,17 +4,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-export const defaultConfig = {
-  enabled: true,
-  workspaceRoots: ["~/.openclaw/workspace"],
-  checkpointDir: "~/.openclaw/plugins/step-rollback/checkpoints",
-  registryDir: "~/.openclaw/plugins/step-rollback/registry",
-  runtimeDir: "~/.openclaw/plugins/step-rollback/runtime",
-  reportsDir: "~/.openclaw/plugins/step-rollback/reports",
-  maxCheckpointsPerSession: 100,
-  allowContinuePrompt: true,
-  stopRunBeforeRollback: true
-};
+export { defaultConfig } from "./contracts.js";
+import { updateJsonFile } from "./persistence.js";
+import { defaultConfig } from "./contracts.js";
 
 export function nowIso() {
   return new Date().toISOString();
@@ -220,11 +212,13 @@ export class SequenceStore {
   }
 
   async next(prefix) {
-    const state = await readJson(this.filePath, {});
-    const nextValue = (state[prefix] ?? 0) + 1;
+    let nextValue = 1;
 
-    state[prefix] = nextValue;
-    await writeJson(this.filePath, state);
+    await updateJsonFile(this.filePath, {}, (state) => {
+      nextValue = (state[prefix] ?? 0) + 1;
+      state[prefix] = nextValue;
+      return state;
+    });
 
     return `${prefix}_${String(nextValue).padStart(4, "0")}`;
   }

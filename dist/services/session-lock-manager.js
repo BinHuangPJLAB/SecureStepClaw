@@ -1,7 +1,6 @@
-import fs from "node:fs/promises";
 import path from "node:path";
 
-import { ensureDir, nowIso, removePath } from "../core/utils.js";
+import { nowIso, removePath, writeJson } from "../core/utils.js";
 
 export class SessionLockManager {
   constructor({ config }) {
@@ -27,8 +26,7 @@ export class SessionLockManager {
     await previous;
 
     const lockFile = this.lockFile(agentId, sessionId);
-    await ensureDir(path.dirname(lockFile));
-    await fs.writeFile(lockFile, `${JSON.stringify({ agentId, sessionId, lockedAt: nowIso() }, null, 2)}\n`, "utf8");
+    await writeJson(lockFile, { agentId, sessionId, lockedAt: nowIso() });
 
     try {
       return await task();

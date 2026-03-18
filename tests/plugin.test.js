@@ -1804,6 +1804,10 @@ const fs = require("node:fs/promises");
     assert.equal(childTranscriptEntries[0].id, childSessionId);
     assert.equal(childTranscriptEntries[0].cwd, childAgent.workspace);
     assert.equal(childTranscriptEntries.some((entry) => entry.id === "entry-continue-cli"), true);
+    assert.equal(
+      childTranscriptEntries[1].message.content[0].arguments.file_path,
+      path.join(childAgent.workspace, "continue.txt")
+    );
 
     const childSessionIndex = JSON.parse(await fs.readFile(path.join(childSessionsDir, "sessions.json"), "utf8"));
     assert.deepEqual(Object.keys(childSessionIndex), ["agent:main-cp-0001:main"]);
