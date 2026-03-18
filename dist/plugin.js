@@ -316,6 +316,45 @@ function toRollbackStatus(agentId, sessionId, state) {
   };
 }
 
+function timestampValue(value) {
+  const parsed = Date.parse(value ?? "");
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function compareTimeline(left, right, fallbackKeys = []) {
+  const createdDelta = timestampValue(left?.createdAt) - timestampValue(right?.createdAt);
+
+  if (createdDelta !== 0) {
+    return createdDelta;
+  }
+
+  const updatedDelta = timestampValue(left?.updatedAt) - timestampValue(right?.updatedAt);
+
+  if (updatedDelta !== 0) {
+    return updatedDelta;
+  }
+
+  for (const key of fallbackKeys) {
+    const compare = String(left?.[key] ?? "").localeCompare(String(right?.[key] ?? ""));
+
+    if (compare !== 0) {
+      return compare;
+    }
+  }
+
+  return 0;
+}
+
+function buildSessionTreeKey(agentId, sessionId) {
+  return `${agentId}::${sessionId}`;
+}
+
+function appendMapValue(map, key, value) {
+  const current = map.get(key) ?? [];
+  current.push(value);
+  map.set(key, current);
+}
+
 export class StepRollbackPlugin {
   constructor({ config, host, services, logger }) {
     this.config = config;
@@ -340,6 +379,7 @@ export class StepRollbackPlugin {
       "steprollback.rollback.status": (input) => this.rollbackStatus(input),
       "steprollback.reports.get": (input) => this.getReport(input),
       "steprollback.session.nodes.list": (input) => this.listSessionNodes(input),
+      "steprollback.session.tree": (input) => this.listSessionTree(input),
       "steprollback.session.checkout": (input) => this.checkoutSession(input),
       "steprollback.session.branch.get": (input) => this.getBranch(input)
     };
@@ -746,6 +786,279 @@ export class StepRollbackPlugin {
     return { agentId, sessionId, nodes };
   }
 
+  async listSessionTree({ agentId, sessionId, nodeId, checkpointId }) {
+    const requestedAgentId = typeof agentId === "string" ? agentId.trim() : "";
+    const requestedSessionId = typeof sessionId === "string" ? sessionId.trim() : "";
+    const requestedNodeId = typeof nodeId === "string" && nodeId.trim()
+      ? nodeId.trim()
+      : typeof checkpointId === "string" && checkpointId.trim()
+        ? checkpointId.trim()
+        : "";
+    const sessionIndexes = await this.services.registry.listSessionIndexes();
+    const sessionIndexByKey = new Map();
+    const sessionKeysBySessionId = new Map();
+    const checkpointsById = new Map();
+    const checkpointsBySessionKey = new Map();
+
+    for (const sessionIndex of sessionIndexes) {
+      const sessionKey = buildSessionTreeKey(sessionIndex.agentId, sessionIndex.sessionId);
+      sessionIndexByKey.set(sessionKey, sessionIndex);
+      appendMapValue(sessionKeysBySessionId, sessionIndex.sessionId, sessionKey);
+      checkpointsBySessionKey.set(sessionKey, sessionIndex.checkpoints ?? []);
+
+      for (const checkpoint of sessionIndex.checkpoints ?? []) {
+        checkpointsById.set(checkpoint.checkpointId, checkpoint);
+      }
+    }
+
+    const resolveSessionKey = (resolvedAgentId, resolvedSessionId) => {
+      if (!resolvedSessionId) {
+        return null;
+      }
+
+      if (resolvedAgentId) {
+        const directKey = buildSessionTreeKey(resolvedAgentId, resolvedSessionId);
+        return sessionIndexByKey.has(directKey) ? directKey : null;
+      }
+
+      const matches = sessionKeysBySessionId.get(resolvedSessionId) ?? [];
+      return matches[0] ?? null;
+    };
+
+    const resolveCheckpointByEntry = (resolvedAgentId, resolvedSessionId, entryId) => {
+      if (!resolvedSessionId || !entryId) {
+        return null;
+      }
+
+      const resolvedSessionKey = resolveSessionKey(resolvedAgentId, resolvedSessionId);
+      const checkpoints = resolvedSessionKey ? checkpointsBySessionKey.get(resolvedSessionKey) ?? [] : [];
+      return checkpoints.find((checkpoint) => checkpoint.entryId === entryId) ?? null;
+    };
+
+    const rawBranches = await this.services.registry.listBranches();
+    const normalizedBranches = rawBranches
+      .map((branch) => {
+        const resolvedChildSessionKey = resolveSessionKey(branch.newAgentId, branch.newSessionId);
+        const resolvedSourceSessionKey = resolveSessionKey(branch.sourceAgentId, branch.sourceSessionId);
+        const sourceCheckpoint = branch.sourceCheckpointId
+          ? checkpointsById.get(branch.sourceCheckpointId) ?? null
+          : resolveCheckpointByEntry(branch.sourceAgentId, branch.sourceSessionId, branch.sourceEntryId);
+        const childRootCheckpoint = resolvedChildSessionKey
+          ? (checkpointsBySessionKey.get(resolvedChildSessionKey) ?? [])[0] ?? null
+          : null;
+
+        return {
+          ...branch,
+          reason: branch.reason ?? branch.branchType ?? "branch",
+          sourceSessionKey: resolvedSourceSessionKey,
+          childSessionKey: resolvedChildSessionKey,
+          sourceCheckpointId: sourceCheckpoint?.checkpointId ?? branch.sourceCheckpointId ?? null,
+          childRootCheckpointId: childRootCheckpoint?.checkpointId ?? null
+        };
+      })
+      .filter((branch) => branch.childSessionKey || branch.sourceSessionKey || branch.sourceCheckpointId);
+    const childSessionKeys = new Set(
+      normalizedBranches
+        .map((branch) => branch.childSessionKey)
+        .filter(Boolean)
+    );
+    let rootCheckpoint = requestedNodeId ? checkpointsById.get(requestedNodeId) ?? null : null;
+    let resolvedBy = requestedNodeId ? "node" : requestedSessionId ? "session" : "default";
+
+    if (requestedNodeId && !rootCheckpoint) {
+      rootCheckpoint = await this.services.checkpointManager.get(requestedNodeId);
+    }
+
+    if (!requestedNodeId) {
+      let targetSessionIndex = null;
+
+      if (requestedSessionId) {
+        const sessionKey = resolveSessionKey(requestedAgentId, requestedSessionId);
+        targetSessionIndex = sessionKey ? sessionIndexByKey.get(sessionKey) ?? null : null;
+        ensureCondition(
+          targetSessionIndex,
+          "SESSION_NOT_FOUND",
+          requestedAgentId
+            ? `Session '${requestedSessionId}' was not found for agent '${requestedAgentId}'.`
+            : `Session '${requestedSessionId}' was not found in checkpoint history.`,
+          { agentId: requestedAgentId || undefined, sessionId: requestedSessionId }
+        );
+      } else {
+        const candidates = sessionIndexes.filter((entry) => !requestedAgentId || entry.agentId === requestedAgentId);
+
+        ensureCondition(
+          candidates.length > 0,
+          "SESSION_NOT_FOUND",
+          requestedAgentId
+            ? `No checkpoint sessions were found for agent '${requestedAgentId}'.`
+            : "No checkpoint sessions were found.",
+          { agentId: requestedAgentId || undefined }
+        );
+
+        const rootCandidates = candidates.filter(
+          (entry) => !childSessionKeys.has(buildSessionTreeKey(entry.agentId, entry.sessionId))
+        );
+        const sortedCandidates = [...(rootCandidates.length > 0 ? rootCandidates : candidates)]
+          .sort((left, right) => compareTimeline(left, right, ["agentId", "sessionId"]));
+        targetSessionIndex = sortedCandidates[0] ?? null;
+      }
+
+      rootCheckpoint = targetSessionIndex?.checkpoints?.[0] ?? null;
+    }
+
+    ensureCondition(
+      rootCheckpoint,
+      "CHECKPOINT_NOT_FOUND",
+      requestedNodeId
+        ? `Node '${requestedNodeId}' was not found.`
+        : requestedSessionId
+          ? `Session '${requestedSessionId}' does not have any checkpoints.`
+          : requestedAgentId
+            ? `Agent '${requestedAgentId}' does not have any checkpoints yet.`
+            : "No checkpoints were found.",
+      {
+        agentId: requestedAgentId || undefined,
+        sessionId: requestedSessionId || undefined,
+        checkpointId: requestedNodeId || undefined
+      }
+    );
+
+    const rootSessionKey = buildSessionTreeKey(rootCheckpoint.agentId, rootCheckpoint.sessionId);
+
+    if (!sessionIndexByKey.has(rootSessionKey)) {
+      const rootSessionCheckpoints = await this.services.checkpointManager.list(rootCheckpoint.agentId, rootCheckpoint.sessionId);
+      sessionIndexByKey.set(rootSessionKey, {
+        agentId: rootCheckpoint.agentId,
+        sessionId: rootCheckpoint.sessionId,
+        checkpoints: rootSessionCheckpoints
+      });
+      checkpointsBySessionKey.set(rootSessionKey, rootSessionCheckpoints);
+
+      for (const checkpoint of rootSessionCheckpoints) {
+        checkpointsById.set(checkpoint.checkpointId, checkpoint);
+      }
+    }
+
+    const branchesBySourceCheckpointId = new Map();
+
+    for (const branch of normalizedBranches) {
+      if (!branch.sourceCheckpointId || !branch.childRootCheckpointId) {
+        continue;
+      }
+
+      appendMapValue(branchesBySourceCheckpointId, branch.sourceCheckpointId, branch);
+    }
+
+    for (const [sourceCheckpointId, branches] of branchesBySourceCheckpointId.entries()) {
+      branches.sort((left, right) => {
+        const leftCheckpoint = checkpointsById.get(left.childRootCheckpointId) ?? left;
+        const rightCheckpoint = checkpointsById.get(right.childRootCheckpointId) ?? right;
+        return compareTimeline(leftCheckpoint, rightCheckpoint, ["branchId", "childRootCheckpointId"]);
+      });
+      branchesBySourceCheckpointId.set(sourceCheckpointId, branches);
+    }
+
+    const buildTree = (currentCheckpointId, incoming = null, lineage = new Set()) => {
+      if (lineage.has(currentCheckpointId)) {
+        return null;
+      }
+
+      const checkpoint = checkpointsById.get(currentCheckpointId) ?? null;
+
+      if (!checkpoint) {
+        return null;
+      }
+
+      const nextLineage = new Set(lineage);
+      nextLineage.add(currentCheckpointId);
+
+      const sessionKey = buildSessionTreeKey(checkpoint.agentId, checkpoint.sessionId);
+      const sessionCheckpoints = checkpointsBySessionKey.get(sessionKey) ?? [];
+      const position = sessionCheckpoints.findIndex((item) => item.checkpointId === currentCheckpointId);
+      const linearChild = position >= 0 ? sessionCheckpoints[position + 1] ?? null : null;
+      const branchChildren = branchesBySourceCheckpointId.get(currentCheckpointId) ?? [];
+      const children = [];
+
+      if (linearChild) {
+        const child = buildTree(linearChild.checkpointId, { type: "linear" }, nextLineage);
+
+        if (child) {
+          children.push(child);
+        }
+      }
+
+      for (const branch of branchChildren) {
+        const child = buildTree(branch.childRootCheckpointId, {
+          type: "branch",
+          branchId: branch.branchId,
+          reason: branch.reason
+        }, nextLineage);
+
+        if (child) {
+          children.push(child);
+        }
+      }
+
+      return {
+        checkpointId: checkpoint.checkpointId,
+        agentId: checkpoint.agentId,
+        sessionId: checkpoint.sessionId,
+        entryId: checkpoint.entryId,
+        nodeIndex: checkpoint.nodeIndex,
+        toolName: checkpoint.toolName,
+        summary: checkpoint.summary,
+        status: checkpoint.status,
+        createdAt: checkpoint.createdAt,
+        incomingType: incoming?.type ?? "root",
+        incomingReason: incoming?.reason ?? null,
+        branchId: incoming?.branchId ?? null,
+        children
+      };
+    };
+
+    const tree = buildTree(rootCheckpoint.checkpointId);
+    const seenCheckpoints = new Set();
+    const seenSessions = new Set();
+    let totalBranches = 0;
+
+    const visit = (node) => {
+      if (!node || seenCheckpoints.has(node.checkpointId)) {
+        return;
+      }
+
+      seenCheckpoints.add(node.checkpointId);
+      seenSessions.add(buildSessionTreeKey(node.agentId, node.sessionId));
+
+      if (node.incomingType === "branch") {
+        totalBranches += 1;
+      }
+
+      for (const child of node.children ?? []) {
+        visit(child);
+      }
+    };
+
+    visit(tree);
+
+    return {
+      agentId: rootCheckpoint.agentId,
+      sessionId: rootCheckpoint.sessionId,
+      root: {
+        checkpointId: rootCheckpoint.checkpointId,
+        agentId: rootCheckpoint.agentId,
+        sessionId: rootCheckpoint.sessionId,
+        entryId: rootCheckpoint.entryId,
+        nodeIndex: rootCheckpoint.nodeIndex,
+        resolvedBy,
+        usedDefaultRoot: resolvedBy === "default"
+      },
+      tree,
+      totalNodes: seenCheckpoints.size,
+      totalSessions: seenSessions.size,
+      totalBranches
+    };
+  }
+
   async checkoutSession({
     agentId,
     sourceSessionId,
@@ -846,11 +1159,16 @@ export class StepRollbackPlugin {
 
       const branchRecord = {
         branchId,
+        branchType: "session",
+        sourceAgentId: agentId,
         sourceSessionId,
         sourceEntryId,
+        sourceCheckpointId: checkpoint.checkpointId,
+        newAgentId: agentId,
         newSessionId: resolvedSessionId,
         newSessionKey: resolvedSessionKey,
-        createdAt: nowIso()
+        createdAt: nowIso(),
+        reason: continueAfterCheckout ? "checkout-continue" : "checkout"
       };
       await this.services.registry.saveBranch(branchRecord);
 
