@@ -2,7 +2,8 @@ import { resolveAbsolutePath } from "./core/utils.js";
 import { createCliMethodInvoker, registerCli } from "./native/cli.js";
 import { createNativeHostBridge, registerGatewayMethods, registerLifecycleHooks, registerService } from "./native/runtime.js";
 import { createLogger, prepareResolvedConfig, resolvePluginConfig } from "./native/shared.js";
-import { createStepRollbackPlugin, manifest } from "./plugin.js";
+import { manifest } from "./core/contracts.js";
+import { createStepRollbackPlugin } from "./plugin.js";
 
 export function createNativeStepRollbackPlugin(options = {}) {
   return {

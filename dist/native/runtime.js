@@ -2,9 +2,9 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { GATEWAY_METHOD_NAMES, HOOK_BINDINGS, manifest } from "../core/contracts.js";
 import { StepRollbackError } from "../core/errors.js";
 import { copyPath, ensureDir, pathExists, readJson, removePath, resolveAbsolutePath, writeJson } from "../core/utils.js";
-import { manifest } from "../plugin.js";
 import { invokeAgentViaCli } from "./cli.js";
 import {
   buildAgentSessionKey,
@@ -31,27 +31,6 @@ import {
   toNativeErrorPayload,
   unwrapRpcResult
 } from "./shared.js";
-
-const HOOK_BINDINGS = [
-  { hookName: "session_start", handlerName: "sessionStart", kind: "session" },
-  { hookName: "session_end", handlerName: "sessionEnd", kind: "session" },
-  { hookName: "before_tool_call", handlerName: "beforeToolCall", kind: "tool" },
-  { hookName: "after_tool_call", handlerName: "afterToolCall", kind: "tool" }
-];
-
-const GATEWAY_METHOD_NAMES = [
-  "steprollback.status",
-  "steprollback.checkpoints.list",
-  "steprollback.checkpoints.get",
-  "steprollback.rollback",
-  "steprollback.continue",
-  "steprollback.rollback.status",
-  "steprollback.reports.get",
-  "steprollback.session.nodes.list",
-  "steprollback.session.tree",
-  "steprollback.session.checkout",
-  "steprollback.session.branch.get"
-];
 
 const OMITTED_AUTH_KEYS = new Set([
   "auth",
@@ -887,6 +866,8 @@ export function createNativeHostBridge(api, logger, options = {}) {
         const childTranscriptEntries = forkSessionTranscriptEntries(transcriptPrefix, {
           sourceSessionId,
           targetSessionId: childSessionId,
+          sourceWorkspacePath,
+          targetSessionKey: childSessionKey,
           targetWorkspacePath: childWorkspacePath
         });
 

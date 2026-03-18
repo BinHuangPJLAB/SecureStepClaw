@@ -3,9 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 
+import { METHOD_NAMES, manifest } from "../core/contracts.js";
 import { StepRollbackError, toStepRollbackError } from "../core/errors.js";
 import { ensureDir, readJson, resolveAbsolutePath, resolveConfig, writeJson } from "../core/utils.js";
-import { manifest } from "../plugin.js";
 import { annotateBranchSessionRecord, buildBranchSessionLabel, extractAgentRunMetadata, findContinuationSessionRecord, getConfiguredAgents, listSessionsForAgent, normalizeAgentIdInput, normalizeExternalParams, readSessionIndexState, resolveSessionRecordEventually } from "./sessions.js";
 import { buildSetupPluginConfig, callGatewayMethod, parseJsonOutput, patchPluginSetupDocument, pickNonEmptyString, resolveOpenClawConfigPath, unwrapRpcResult } from "./shared.js";
 
@@ -492,67 +492,344 @@ function printCheckpointTree(result, options = {}) {
   console.log(lines.join("\n"));
 }
 
-const STEP_ROLLBACK_CLI_OVERVIEW = [
-  {
-    usage: "setup [--base-dir <path>] [--dry-run] [--json]",
-    description: "Initialize Step Rollback config in openclaw.json."
+const CLI_BEHAVIORS = {
+  read: {
+    preferGateway: true,
+    fallbackToLocal: true
   },
-  {
-    usage: "status",
-    description: "Show plugin runtime status."
-  },
-  {
-    usage: "agents [--json]",
-    description: "List configured OpenClaw agents."
-  },
-  {
-    usage: "sessions --agent <agentId> [--json]",
-    description: "List sessions for an agent."
-  },
-  {
-    usage: "checkpoints --agent <agentId> --session <sessionId> [--json]",
-    description: "List checkpoints for a session."
-  },
-  {
-    usage: "checkpoint --checkpoint <checkpointId> [--json]",
-    description: "Show one checkpoint by id."
-  },
-  {
-    usage: "rollback-status --agent <agentId> --session <sessionId> [--json]",
-    description: "Show rollback state for a session."
-  },
-  {
-    usage: "rollback --agent <agentId> --session <sessionId> --checkpoint <checkpointId> [--restore-workspace] [--json]",
-    description: "Restore a session to a checkpoint."
-  },
-  {
-    usage: "continue --agent <agentId> --session <sessionId> --checkpoint <checkpointId> --prompt <text> [--new-agent <agentId>] [--clone-auth <mode>] [--log] [--json]",
-    description: "Continue from a checkpoint by creating a fresh child agent."
-  },
-  {
-    usage: "nodes --agent <agentId> --session <sessionId> [--json]",
-    description: "List checkpoint-backed nodes for checkout."
-  },
-  {
-    usage: "tree [--agent <agentId>] [--session <sessionId>] [--node <checkpointId>] [--json]",
-    description: "Show checkpoint lineage as a tree."
-  },
-  {
-    usage: "checkout --agent <agentId> --source-session <sessionId> --entry <entryId> [--continue] [--prompt <text>] [--json]",
-    description: "Create a new session from a checkpoint-backed entry."
-  },
-  {
-    usage: "report --rollback <rollbackId> [--json]",
-    description: "Show a rollback report."
-  },
-  {
-    usage: "branch --branch <branchId> [--json]",
-    description: "Show a checkout branch record."
+  mutate: {
+    preferGateway: false,
+    fallbackToLocal: true
   }
+};
+
+function createCliOption(flags, description, required = false) {
+  return {
+    flags,
+    description,
+    required
+  };
+}
+
+const JSON_OPTION = createCliOption("--json", "Output raw JSON.");
+const AGENT_COLUMNS = [
+  { key: "id", label: "Agent" },
+  { key: "name", label: "Name" },
+  { key: "workspace", label: "Workspace" },
+  { key: "model", label: "Model" }
+];
+const SESSION_COLUMNS = [
+  { key: "marker", label: "Mark" },
+  { key: "sessionId", label: "Session" },
+  { key: "title", label: "Title" },
+  { key: "updatedAt", label: "Updated" },
+  { key: "createdAt", label: "Created" },
+  { key: "branchOf", label: "Branch Of" }
+];
+const NODE_COLUMNS = [
+  { key: "entryId", label: "Entry" },
+  { key: "nodeIndex", label: "Node" },
+  { key: "toolName", label: "Tool" },
+  { key: "checkoutAvailable", label: "Checkout" },
+  { key: "createdAt", label: "Created" }
+];
+const CHECKPOINT_COLUMNS = [
+  { key: "checkpointId", label: "Checkpoint" },
+  { key: "nodeIndex", label: "Node" },
+  { key: "toolName", label: "Tool" },
+  { key: "status", label: "Status" },
+  { key: "createdAt", label: "Created" },
+  { key: "summary", label: "Summary" }
+];
+
+function rowsPrinter(columns, options = {}) {
+  const {
+    select = (result) => result,
+    transformRow,
+    emptyMessage = "No records found."
+  } = options;
+
+  return (result, cliOptions) => {
+    printRows(select(result), columns, {
+      json: cliOptions.json,
+      transformRow,
+      emptyMessage: typeof emptyMessage === "function" ? emptyMessage(cliOptions, result) : emptyMessage
+    });
+  };
+}
+
+function objectPrinter(select = (result) => result) {
+  return (result, cliOptions) => {
+    printObject(select(result), cliOptions);
+  };
+}
+
+function jsonPrinter() {
+  return (result) => {
+    console.log(JSON.stringify(result, null, 2));
+  };
+}
+
+function rpcCommand(definition) {
+  return {
+    ...definition,
+    run: ({ cliMethodInvoker, ...context }, options) =>
+      cliMethodInvoker(
+        definition.method,
+        definition.params({ cliMethodInvoker, ...context }, options),
+        typeof definition.behavior === "function" ? definition.behavior(options) : definition.behavior
+      )
+  };
+}
+
+const CLI_COMMANDS = [
+  {
+    name: "setup",
+    usage: "setup [--base-dir <path>] [--dry-run] [--json]",
+    description: "Initialize Step Rollback config in openclaw.json.",
+    options: [
+      createCliOption("--base-dir <path>", "Base OpenClaw state directory. Defaults to OPENCLAW_STATE_DIR, OPENCLAW_HOME, or ~/.openclaw."),
+      createCliOption("--dry-run", "Preview the config patch without writing files."),
+      JSON_OPTION
+    ],
+    run: async (_context, options) =>
+      runSetupCommand({
+        baseDir: options.baseDir,
+        dryRun: Boolean(options.dryRun)
+      }),
+    print: objectPrinter()
+  },
+  {
+    name: "status",
+    usage: "status",
+    description: "Show plugin runtime status.",
+    run: async ({ engine }) => engine.status(),
+    print: jsonPrinter()
+  },
+  {
+    name: "agents",
+    usage: "agents [--json]",
+    description: "List configured OpenClaw agents.",
+    options: [JSON_OPTION],
+    run: async ({ api }) => getConfiguredAgents(api),
+    print: rowsPrinter(AGENT_COLUMNS, {
+      emptyMessage: "No agents were found in the OpenClaw config."
+    })
+  },
+  {
+    name: "sessions",
+    usage: "sessions --agent <agentId> [--json]",
+    description: "List sessions for an agent.",
+    options: [
+      createCliOption("--agent <agentId>", "", true),
+      JSON_OPTION
+    ],
+    run: async ({ api }, options) => listSessionsForAgent(api, options.agent),
+    print: rowsPrinter(SESSION_COLUMNS, {
+      transformRow: highlightSessionRow,
+      emptyMessage: (options) => `No sessions were found for agent '${options.agent}'.`
+    })
+  },
+  rpcCommand({
+    name: "checkpoints",
+    usage: "checkpoints --agent <agentId> --session <sessionId> [--json]",
+    description: "List checkpoints for a session.",
+    method: METHOD_NAMES.checkpointsList,
+    behavior: CLI_BEHAVIORS.read,
+    options: [
+      createCliOption("--agent <agentId>", "", true),
+      createCliOption("--session <sessionId>", "", true),
+      JSON_OPTION
+    ],
+    params: (_context, options) => ({
+      agentId: options.agent,
+      sessionId: options.session
+    }),
+    print: rowsPrinter(CHECKPOINT_COLUMNS, {
+      select: (result) => result.checkpoints,
+      transformRow: highlightCheckpointRow,
+      emptyMessage: (options) => `No checkpoints were found for session '${options.session}'.`
+    })
+  }),
+  rpcCommand({
+    name: "checkpoint",
+    usage: "checkpoint --checkpoint <checkpointId> [--json]",
+    description: "Show one checkpoint by id.",
+    method: METHOD_NAMES.checkpointsGet,
+    behavior: CLI_BEHAVIORS.read,
+    options: [
+      createCliOption("--checkpoint <checkpointId>", "", true),
+      JSON_OPTION
+    ],
+    params: (_context, options) => ({
+      checkpointId: options.checkpoint
+    }),
+    print: objectPrinter((result) => result.checkpoint)
+  }),
+  rpcCommand({
+    name: "rollback-status",
+    usage: "rollback-status --agent <agentId> --session <sessionId> [--json]",
+    description: "Show rollback state for a session.",
+    method: METHOD_NAMES.rollbackStatus,
+    behavior: CLI_BEHAVIORS.read,
+    options: [
+      createCliOption("--agent <agentId>", "", true),
+      createCliOption("--session <sessionId>", "", true),
+      JSON_OPTION
+    ],
+    params: (_context, options) => ({
+      agentId: options.agent,
+      sessionId: options.session
+    }),
+    print: objectPrinter()
+  }),
+  rpcCommand({
+    name: "rollback",
+    usage: "rollback --agent <agentId> --session <sessionId> --checkpoint <checkpointId> [--restore-workspace] [--json]",
+    description: "Restore a session to a checkpoint.",
+    method: METHOD_NAMES.rollback,
+    behavior: CLI_BEHAVIORS.mutate,
+    options: [
+      createCliOption("--agent <agentId>", "", true),
+      createCliOption("--session <sessionId>", "", true),
+      createCliOption("--checkpoint <checkpointId>", "", true),
+      createCliOption("--restore-workspace", "Also restore the agent workspace in place."),
+      JSON_OPTION
+    ],
+    params: (_context, options) => ({
+      agentId: options.agent,
+      sessionId: options.session,
+      checkpointId: options.checkpoint,
+      restoreWorkspace: Boolean(options.restoreWorkspace)
+    }),
+    print: objectPrinter()
+  }),
+  rpcCommand({
+    name: "continue",
+    usage: "continue --agent <agentId> --session <sessionId> --checkpoint <checkpointId> --prompt <text> [--new-agent <agentId>] [--clone-auth <mode>] [--log] [--json]",
+    description: "Continue from a checkpoint by creating a fresh child agent.",
+    method: METHOD_NAMES.continue,
+    behavior: CLI_BEHAVIORS.mutate,
+    options: [
+      createCliOption("--agent <agentId>", "", true),
+      createCliOption("--session <sessionId>", "", true),
+      createCliOption("--checkpoint <checkpointId>", "Checkpoint id or 'latest'.", true),
+      createCliOption("--prompt <text>", "Prompt for the child agent.", true),
+      createCliOption("--new-agent <agentId>", "Optional child agent id override."),
+      createCliOption("--clone-auth <mode>", "Auth copy mode: auto|always|never."),
+      createCliOption("--log", "Capture child launch diagnostics in the plugin runtime logs."),
+      JSON_OPTION
+    ],
+    params: (_context, options) => ({
+      agentId: options.agent,
+      sessionId: options.session,
+      checkpointId: options.checkpoint,
+      prompt: options.prompt,
+      newAgentId: options.newAgent,
+      cloneAuth: options.cloneAuth,
+      log: Boolean(options.log)
+    }),
+    print: objectPrinter()
+  }),
+  rpcCommand({
+    name: "nodes",
+    usage: "nodes --agent <agentId> --session <sessionId> [--json]",
+    description: "List checkpoint-backed nodes for checkout.",
+    method: METHOD_NAMES.sessionNodesList,
+    behavior: CLI_BEHAVIORS.read,
+    options: [
+      createCliOption("--agent <agentId>", "", true),
+      createCliOption("--session <sessionId>", "", true),
+      JSON_OPTION
+    ],
+    params: (_context, options) => ({
+      agentId: options.agent,
+      sessionId: options.session
+    }),
+    print: rowsPrinter(NODE_COLUMNS, {
+      select: (result) => result.nodes,
+      emptyMessage: (options) => `No checkpoint-backed nodes were found for session '${options.session}'.`
+    })
+  }),
+  rpcCommand({
+    name: "tree",
+    usage: "tree [--agent <agentId>] [--session <sessionId>] [--node <checkpointId>] [--json]",
+    description: "Show checkpoint lineage as a tree.",
+    method: METHOD_NAMES.sessionTree,
+    behavior: CLI_BEHAVIORS.read,
+    options: [
+      createCliOption("--agent <agentId>", "Root agent id. Defaults to the configured default agent."),
+      createCliOption("--session <sessionId>", "Optional root session id. Defaults to the first root session for the agent."),
+      createCliOption("--node <checkpointId>", "Optional root node id. This is the checkpoint id used as the tree root."),
+      createCliOption("--checkpoint <checkpointId>", "Alias for --node."),
+      JSON_OPTION
+    ],
+    params: ({ api }, options) => ({
+      agentId: normalizeAgentIdInput(api, options.agent),
+      sessionId: options.session,
+      nodeId: pickNonEmptyString(options.node, options.checkpoint)
+    }),
+    print: (result, options) => {
+      printCheckpointTree(result, options);
+    }
+  }),
+  rpcCommand({
+    name: "checkout",
+    usage: "checkout --agent <agentId> --source-session <sessionId> --entry <entryId> [--continue] [--prompt <text>] [--json]",
+    description: "Create a new session from a checkpoint-backed entry.",
+    method: METHOD_NAMES.sessionCheckout,
+    behavior: (options) => options.continue ? CLI_BEHAVIORS.mutate : CLI_BEHAVIORS.read,
+    options: [
+      createCliOption("--agent <agentId>", "", true),
+      createCliOption("--source-session <sessionId>", "", true),
+      createCliOption("--entry <entryId>", "", true),
+      createCliOption("--continue", "Continue immediately after checkout."),
+      createCliOption("--prompt <text>", "Optional prompt used when continuing after checkout."),
+      JSON_OPTION
+    ],
+    params: (_context, options) => ({
+      agentId: options.agent,
+      sourceSessionId: options.sourceSession,
+      sourceEntryId: options.entry,
+      continueAfterCheckout: Boolean(options.continue),
+      prompt: options.prompt
+    }),
+    print: objectPrinter()
+  }),
+  rpcCommand({
+    name: "report",
+    usage: "report --rollback <rollbackId> [--json]",
+    description: "Show a rollback report.",
+    method: METHOD_NAMES.reportsGet,
+    behavior: CLI_BEHAVIORS.read,
+    options: [
+      createCliOption("--rollback <rollbackId>", "", true),
+      JSON_OPTION
+    ],
+    params: (_context, options) => ({
+      rollbackId: options.rollback
+    }),
+    print: objectPrinter()
+  }),
+  rpcCommand({
+    name: "branch",
+    usage: "branch --branch <branchId> [--json]",
+    description: "Show a checkout branch record.",
+    method: METHOD_NAMES.sessionBranchGet,
+    behavior: CLI_BEHAVIORS.read,
+    options: [
+      createCliOption("--branch <branchId>", "", true),
+      JSON_OPTION
+    ],
+    params: (_context, options) => ({
+      branchId: options.branch
+    }),
+    print: objectPrinter()
+  })
 ];
 
 function renderCliOverview() {
-  const rows = STEP_ROLLBACK_CLI_OVERVIEW.map((entry) => ({
+  const rows = CLI_COMMANDS.map((entry) => ({
     command: entry.usage,
     description: entry.description
   }));
@@ -830,13 +1107,10 @@ export function registerCli(api, engine, cliMethodInvoker) {
     return;
   }
 
-  const readBehavior = {
-    preferGateway: true,
-    fallbackToLocal: true
-  };
-  const mutateBehavior = {
-    preferGateway: false,
-    fallbackToLocal: true
+  const context = {
+    api,
+    engine,
+    cliMethodInvoker
   };
 
   api.registerCli(
@@ -844,255 +1118,23 @@ export function registerCli(api, engine, cliMethodInvoker) {
       const command = program.command("steprollback").description("Inspect the Step Rollback native plugin.");
       attachCliOverviewHelp(command);
 
-      command
-        .command("setup")
-        .description("Initialize Step Rollback config in openclaw.json.")
-        .option("--base-dir <path>", "Base OpenClaw state directory. Defaults to OPENCLAW_STATE_DIR, OPENCLAW_HOME, or ~/.openclaw.")
-        .option("--dry-run", "Preview the config patch without writing files.")
-        .option("--json", "Output raw JSON.")
-        .action(async (options) => {
-          const result = await runSetupCommand({
-            baseDir: options.baseDir,
-            dryRun: Boolean(options.dryRun)
-          });
-          printObject(result, options);
-        });
+      for (const definition of CLI_COMMANDS) {
+        const subcommand = command.command(definition.name).description(definition.description);
 
-      command.command("status").action(async () => {
-        const result = await engine.status();
-        console.log(JSON.stringify(result, null, 2));
-      });
+        for (const option of definition.options ?? []) {
+          if (option.required) {
+            subcommand.requiredOption(option.flags, option.description);
+            continue;
+          }
 
-      command
-        .command("agents")
-        .description("List configured OpenClaw agents.")
-        .option("--json", "Output raw JSON.")
-        .action(async (options) => {
-          const agents = getConfiguredAgents(api);
-          printRows(
-            agents,
-            [
-              { key: "id", label: "Agent" },
-              { key: "name", label: "Name" },
-              { key: "workspace", label: "Workspace" },
-              { key: "model", label: "Model" }
-            ],
-            {
-              json: options.json,
-              emptyMessage: "No agents were found in the OpenClaw config."
-            }
-          );
-        });
+          subcommand.option(option.flags, option.description);
+        }
 
-      command
-        .command("sessions")
-        .description("List sessions for an agent without passing JSON.")
-        .requiredOption("--agent <agentId>")
-        .option("--json", "Output raw JSON.")
-        .action(async (options) => {
-          const sessions = await listSessionsForAgent(api, options.agent);
-          printRows(
-            sessions,
-            [
-              { key: "marker", label: "Mark" },
-              { key: "sessionId", label: "Session" },
-              { key: "title", label: "Title" },
-              { key: "updatedAt", label: "Updated" },
-              { key: "createdAt", label: "Created" },
-              { key: "branchOf", label: "Branch Of" }
-            ],
-            {
-              json: options.json,
-              transformRow: highlightSessionRow,
-              emptyMessage: `No sessions were found for agent '${options.agent}'.`
-            }
-          );
+        subcommand.action(async (options = {}) => {
+          const result = await definition.run(context, options);
+          definition.print(result, options, context);
         });
-
-      command
-        .command("checkpoints")
-        .description("List checkpoints for a session.")
-        .requiredOption("--agent <agentId>")
-        .requiredOption("--session <sessionId>")
-        .option("--json", "Output raw JSON.")
-        .action(async (options) => {
-          const result = await cliMethodInvoker("steprollback.checkpoints.list", {
-            agentId: options.agent,
-            sessionId: options.session
-          }, readBehavior);
-          printRows(
-            result.checkpoints,
-            [
-              { key: "checkpointId", label: "Checkpoint" },
-              { key: "nodeIndex", label: "Node" },
-              { key: "toolName", label: "Tool" },
-              { key: "status", label: "Status" },
-              { key: "createdAt", label: "Created" },
-              { key: "summary", label: "Summary" }
-            ],
-            {
-              json: options.json,
-              transformRow: highlightCheckpointRow,
-              emptyMessage: `No checkpoints were found for session '${options.session}'.`
-            }
-          );
-        });
-
-      command
-        .command("checkpoint")
-        .description("Show one checkpoint by id.")
-        .requiredOption("--checkpoint <checkpointId>")
-        .option("--json", "Output raw JSON.")
-        .action(async (options) => {
-          const result = await cliMethodInvoker("steprollback.checkpoints.get", {
-            checkpointId: options.checkpoint
-          }, readBehavior);
-          printObject(result.checkpoint, options);
-        });
-
-      command
-        .command("rollback-status")
-        .description("Show rollback state for a session.")
-        .requiredOption("--agent <agentId>")
-        .requiredOption("--session <sessionId>")
-        .option("--json", "Output raw JSON.")
-        .action(async (options) => {
-          const result = await cliMethodInvoker("steprollback.rollback.status", {
-            agentId: options.agent,
-            sessionId: options.session
-          }, readBehavior);
-          printObject(result, options);
-        });
-
-      command
-        .command("rollback")
-        .description("Rollback a session to a checkpoint. By default this keeps the current workspace untouched.")
-        .requiredOption("--agent <agentId>")
-        .requiredOption("--session <sessionId>")
-        .requiredOption("--checkpoint <checkpointId>")
-        .option("--restore-workspace", "Also restore the agent workspace in place.")
-        .option("--json", "Output raw JSON.")
-        .action(async (options) => {
-          const result = await cliMethodInvoker("steprollback.rollback", {
-            agentId: options.agent,
-            sessionId: options.session,
-            checkpointId: options.checkpoint,
-            restoreWorkspace: Boolean(options.restoreWorkspace)
-          }, mutateBehavior);
-          printObject(result, options);
-        });
-
-      command
-        .command("continue")
-        .description("Continue from a checkpoint by always creating a fresh child agent/session.")
-        .requiredOption("--agent <agentId>")
-        .requiredOption("--session <sessionId>")
-        .requiredOption("--checkpoint <checkpointId>", "Checkpoint id or 'latest'.")
-        .requiredOption("--prompt <text>", "Prompt for the child agent.")
-        .option("--new-agent <agentId>", "Optional child agent id override.")
-        .option("--clone-auth <mode>", "Auth copy mode: auto|always|never.")
-        .option("--log", "Capture child launch diagnostics in the plugin runtime logs.")
-        .option("--json", "Output raw JSON.")
-        .action(async (options) => {
-          const result = await cliMethodInvoker("steprollback.continue", {
-            agentId: options.agent,
-            sessionId: options.session,
-            checkpointId: options.checkpoint,
-            prompt: options.prompt,
-            newAgentId: options.newAgent,
-            cloneAuth: options.cloneAuth,
-            log: Boolean(options.log)
-          }, mutateBehavior);
-          printObject(result, options);
-        });
-
-      command
-        .command("nodes")
-        .description("List checkpoint-backed nodes for checkout.")
-        .requiredOption("--agent <agentId>")
-        .requiredOption("--session <sessionId>")
-        .option("--json", "Output raw JSON.")
-        .action(async (options) => {
-          const result = await cliMethodInvoker("steprollback.session.nodes.list", {
-            agentId: options.agent,
-            sessionId: options.session
-          }, readBehavior);
-          printRows(
-            result.nodes,
-            [
-              { key: "entryId", label: "Entry" },
-              { key: "nodeIndex", label: "Node" },
-              { key: "toolName", label: "Tool" },
-              { key: "checkoutAvailable", label: "Checkout" },
-              { key: "createdAt", label: "Created" }
-            ],
-            {
-              json: options.json,
-              emptyMessage: `No checkpoint-backed nodes were found for session '${options.session}'.`
-            }
-          );
-        });
-
-      command
-        .command("tree")
-        .description("Show checkpoint lineage as a tree.")
-        .option("--agent <agentId>", "Root agent id. Defaults to the configured default agent.")
-        .option("--session <sessionId>", "Optional root session id. Defaults to the first root session for the agent.")
-        .option("--node <checkpointId>", "Optional root node id. This is the checkpoint id used as the tree root.")
-        .option("--checkpoint <checkpointId>", "Alias for --node.")
-        .option("--json", "Output raw JSON.")
-        .action(async (options) => {
-          const result = await cliMethodInvoker("steprollback.session.tree", {
-            agentId: normalizeAgentIdInput(api, options.agent),
-            sessionId: options.session,
-            nodeId: pickNonEmptyString(options.node, options.checkpoint)
-          }, readBehavior);
-          printCheckpointTree(result, options);
-        });
-
-      command
-        .command("checkout")
-        .description("Create a new session from a checkpoint-backed entry.")
-        .requiredOption("--agent <agentId>")
-        .requiredOption("--source-session <sessionId>")
-        .requiredOption("--entry <entryId>")
-        .option("--continue", "Continue immediately after checkout.")
-        .option("--prompt <text>", "Optional prompt used when continuing after checkout.")
-        .option("--json", "Output raw JSON.")
-        .action(async (options) => {
-          const result = await cliMethodInvoker("steprollback.session.checkout", {
-            agentId: options.agent,
-            sourceSessionId: options.sourceSession,
-            sourceEntryId: options.entry,
-            continueAfterCheckout: Boolean(options.continue),
-            prompt: options.prompt
-          }, options.continue ? mutateBehavior : readBehavior);
-          printObject(result, options);
-        });
-
-      command
-        .command("report")
-        .description("Show a rollback report.")
-        .requiredOption("--rollback <rollbackId>")
-        .option("--json", "Output raw JSON.")
-        .action(async (options) => {
-          const result = await cliMethodInvoker("steprollback.reports.get", {
-            rollbackId: options.rollback
-          }, readBehavior);
-          printObject(result, options);
-        });
-
-      command
-        .command("branch")
-        .description("Show a checkout branch record.")
-        .requiredOption("--branch <branchId>")
-        .option("--json", "Output raw JSON.")
-        .action(async (options) => {
-          const result = await cliMethodInvoker("steprollback.session.branch.get", {
-            branchId: options.branch
-          }, readBehavior);
-          printObject(result, options);
-        });
+      }
     },
     { commands: ["steprollback"] }
   );

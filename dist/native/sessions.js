@@ -1,8 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { manifest } from "../core/contracts.js";
 import { nowIso, readJson, resolveAbsolutePath } from "../core/utils.js";
-import { manifest } from "../plugin.js";
 import { pickFirst, pickInteger, pickNonEmptyString, unwrapRpcResult } from "./shared.js";
 
 function sanitizeSessionToken(value, fallback = "branch") {
@@ -854,7 +854,9 @@ function buildForkedSessionRecord(sourceEntry, options = {}) {
 }
 
 export function forkSessionTranscriptEntries(entries, options = {}) {
-  const normalizedEntries = normalizeTranscriptEntries(entries).map((entry) => structuredClone(entry));
+  const normalizedEntries = normalizeTranscriptEntries(entries).map((entry) =>
+    remapSessionMetadataValue(structuredClone(entry), options)
+  );
   let sawSessionEntry = false;
 
   for (const entry of normalizedEntries) {
@@ -866,6 +868,14 @@ export function forkSessionTranscriptEntries(entries, options = {}) {
 
     if (typeof entry.sessionId === "string" || options.sourceSessionId) {
       entry.sessionId = options.targetSessionId;
+    }
+
+    if (typeof entry.sessionKey === "string" || options.targetSessionKey) {
+      entry.sessionKey = options.targetSessionKey;
+    }
+
+    if (typeof entry.key === "string" || options.targetSessionKey) {
+      entry.key = options.targetSessionKey;
     }
 
     if (typeof entry.cwd === "string" || options.targetWorkspacePath) {
@@ -886,6 +896,7 @@ export function forkSessionTranscriptEntries(entries, options = {}) {
       version: 3,
       id: options.targetSessionId,
       timestamp: nowIso(),
+      ...(options.targetSessionKey ? { sessionKey: options.targetSessionKey } : {}),
       cwd: options.targetWorkspacePath
     });
   }
