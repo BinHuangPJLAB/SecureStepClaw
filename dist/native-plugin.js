@@ -16,11 +16,17 @@ export function createNativeStepRollbackPlugin(options = {}) {
         ...(options.config ?? {})
       };
       const config = prepareResolvedConfig(rawConfig, logger);
-      const engine = createStepRollbackPlugin({
+      let engine = null;
+      const hostBridge = createNativeHostBridge(api, logger, {
+        ...options,
+        config,
+        getEngine: () => engine
+      });
+      engine = createStepRollbackPlugin({
         config,
         logger,
         host: {
-          ...createNativeHostBridge(api, logger, options),
+          ...hostBridge,
           ...(options.host ?? {})
         }
       });

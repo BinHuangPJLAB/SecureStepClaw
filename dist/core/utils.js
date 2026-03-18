@@ -188,6 +188,25 @@ export function createDefaultHostBridge(host = {}) {
     startContinueRun: host.startContinueRun ?? (async () => ({
       runId: `run_${crypto.randomUUID()}`
     })),
+    forkContinue: host.forkContinue ?? (async ({
+      sourceAgentId,
+      sourceSessionId,
+      checkpoint,
+      prompt,
+      newAgentId
+    }) => ({
+      ok: true,
+      parentAgentId: sourceAgentId,
+      parentSessionId: sourceSessionId,
+      newAgentId: newAgentId ?? `${sourceAgentId}-cp-${crypto.randomUUID().slice(0, 8)}`,
+      newWorkspacePath: null,
+      newAgentDir: null,
+      newSessionId: crypto.randomUUID(),
+      newSessionKey: null,
+      checkpointId: checkpoint?.checkpointId ?? null,
+      prompt,
+      started: false
+    })),
     createSession: host.createSession ?? (async () => ({
       sessionId: crypto.randomUUID()
     }))

@@ -129,7 +129,7 @@ export class RuntimeCursorManager {
       state.activeHeadEntryId = entryId ?? null;
       state.currentRunId = null;
       state.rollbackInProgress = false;
-      state.awaitingContinue = true;
+      state.awaitingContinue = false;
       state.lastRollbackCheckpointId = checkpointId;
       return state;
     });

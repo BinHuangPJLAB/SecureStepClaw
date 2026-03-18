@@ -2,10 +2,10 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 import { StepRollbackError, toStepRollbackError } from "../core/errors.js";
-import { resolveAbsolutePath } from "../core/utils.js";
+import { ensureDir, readJson, resolveAbsolutePath, resolveConfig, writeJson } from "../core/utils.js";
 import { manifest } from "../plugin.js";
 import { annotateBranchSessionRecord, buildBranchSessionLabel, extractAgentRunMetadata, findContinuationSessionRecord, getConfiguredAgents, listSessionsForAgent, normalizeAgentIdInput, normalizeExternalParams, readSessionIndexState, resolveSessionRecordEventually } from "./sessions.js";
-import { callGatewayMethod, parseJsonOutput, pickNonEmptyString, unwrapRpcResult } from "./shared.js";
+import { buildSetupPluginConfig, callGatewayMethod, parseJsonOutput, patchPluginSetupDocument, pickNonEmptyString, resolveOpenClawConfigPath, unwrapRpcResult } from "./shared.js";
 
 const execFileAsync = promisify(execFile);
 const ANSI_PATTERN = /\u001b\[[0-9;]*m/g;
@@ -83,6 +83,43 @@ async function runCliCommand(command, args, cwd) {
     env: process.env,
     maxBuffer: 10 * 1024 * 1024
   });
+}
+
+async function runSetupCommand(options = {}) {
+  const pluginConfig = buildSetupPluginConfig(options.baseDir);
+  const resolvedPluginConfig = resolveConfig(pluginConfig);
+  const configPath = resolveOpenClawConfigPath();
+  const currentDocument = await readJson(configPath, {});
+  const nextDocument = patchPluginSetupDocument(currentDocument, manifest.id, pluginConfig);
+  const directories = [
+    ...resolvedPluginConfig.workspaceRoots,
+    resolvedPluginConfig.checkpointDir,
+    resolvedPluginConfig.registryDir,
+    resolvedPluginConfig.runtimeDir,
+    resolvedPluginConfig.reportsDir
+  ];
+
+  if (!options.dryRun) {
+    for (const directory of directories) {
+      await ensureDir(directory);
+    }
+
+    await writeJson(configPath, nextDocument.document);
+  }
+
+  return {
+    ok: true,
+    pluginId: manifest.id,
+    configPath,
+    baseDir: pickNonEmptyString(options.baseDir, process.env.OPENCLAW_STATE_DIR, process.env.OPENCLAW_HOME, "~/.openclaw"),
+    changed: nextDocument.changed,
+    dryRun: Boolean(options.dryRun),
+    restartRequired: nextDocument.changed && !options.dryRun,
+    createdDirectories: directories,
+    pluginConfig: nextDocument.document.plugins.entries[manifest.id].config,
+    allow: nextDocument.document.plugins.allow,
+    enabled: nextDocument.document.plugins.enabled
+  };
 }
 
 function stripAnsi(value) {
@@ -258,6 +295,7 @@ export async function invokeAgentViaCli(api, logger, options = {}) {
   const cwd = resolveAbsolutePath("~", options.cliCwd);
   const agentId = normalizeAgentIdInput(api, options.agentId);
   const sourceSessionId = pickNonEmptyString(options.sourceSessionId);
+  const targetSessionId = pickNonEmptyString(options.sessionId);
   const branchLabel = pickNonEmptyString(options.label) || buildBranchSessionLabel(sourceSessionId || agentId, options.branchId ?? "continue");
   const message = pickNonEmptyString(options.prompt) || "Continue from the restored checkpoint.";
   const beforeState = await readSessionIndexState(api, agentId);
@@ -271,6 +309,10 @@ export async function invokeAgentViaCli(api, logger, options = {}) {
     "--json"
   ];
 
+  if (targetSessionId) {
+    args.push("--session-id", targetSessionId);
+  }
+
   logger.info?.(
     `[${manifest.id}] continuing with 'openclaw agent' agent='${agentId}' sourceSession='${sourceSessionId || "-"}'`
   );
@@ -278,9 +320,9 @@ export async function invokeAgentViaCli(api, logger, options = {}) {
   try {
     const result = await runCliCommand(command, args, cwd);
     const extracted = extractAgentRunMetadata(parseJsonOutput(result.stdout, "CONTINUE_START_FAILED"));
-    const resolvedSession = extracted.sessionId || extracted.sessionKey
+    const resolvedSession = extracted.sessionId || extracted.sessionKey || targetSessionId
       ? await resolveSessionRecordEventually(api, agentId, {
-        sessionId: extracted.sessionId,
+        sessionId: extracted.sessionId || targetSessionId,
         sessionKey: extracted.sessionKey
       }, {
         attempts: 10,
@@ -290,7 +332,7 @@ export async function invokeAgentViaCli(api, logger, options = {}) {
         excludeSessionId: sourceSessionId,
         startedAtMs
       });
-    const sessionId = resolvedSession?.sessionId ?? extracted.sessionId ?? null;
+    const sessionId = resolvedSession?.sessionId ?? extracted.sessionId ?? targetSessionId ?? null;
     const sessionKey = resolvedSession?.sessionKey ?? extracted.sessionKey ?? null;
 
     await annotateBranchSessionRecord(api, agentId, {
@@ -430,6 +472,20 @@ export function registerCli(api, engine, cliMethodInvoker) {
     ({ program }) => {
       const command = program.command("steprollback").description("Inspect the Step Rollback native plugin.");
 
+      command
+        .command("setup")
+        .description("Initialize Step Rollback config in openclaw.json.")
+        .option("--base-dir <path>", "Base OpenClaw state directory. Defaults to OPENCLAW_STATE_DIR, OPENCLAW_HOME, or ~/.openclaw.")
+        .option("--dry-run", "Preview the config patch without writing files.")
+        .option("--json", "Output raw JSON.")
+        .action(async (options) => {
+          const result = await runSetupCommand({
+            baseDir: options.baseDir,
+            dryRun: Boolean(options.dryRun)
+          });
+          printObject(result, options);
+        });
+
       command.command("status").action(async () => {
         const result = await engine.status();
         console.log(JSON.stringify(result, null, 2));
@@ -554,16 +610,22 @@ export function registerCli(api, engine, cliMethodInvoker) {
 
       command
         .command("continue")
-        .description("Continue a rolled back session, with an optional prompt.")
+        .description("Fork a new agent and session from a checkpoint.")
         .requiredOption("--agent <agentId>")
         .requiredOption("--session <sessionId>")
-        .option("--prompt <text>", "Optional continuation prompt.")
+        .requiredOption("--checkpoint <checkpointId>", "Checkpoint id or 'latest'.")
+        .requiredOption("--prompt <text>", "Prompt for the child agent.")
+        .option("--new-agent <agentId>", "Optional child agent id override.")
+        .option("--clone-auth <mode>", "Auth copy mode: auto|always|never.")
         .option("--json", "Output raw JSON.")
         .action(async (options) => {
           const result = await cliMethodInvoker("steprollback.continue", {
             agentId: options.agent,
             sessionId: options.session,
-            prompt: options.prompt
+            checkpointId: options.checkpoint,
+            prompt: options.prompt,
+            newAgentId: options.newAgent,
+            cloneAuth: options.cloneAuth
           }, mutateBehavior);
           printObject(result, options);
         });

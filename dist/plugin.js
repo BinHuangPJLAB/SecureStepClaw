@@ -75,6 +75,236 @@ function createNoopLogger() {
   };
 }
 
+const READ_ONLY_TOOL_NAMES = new Set([
+  "read",
+  "read_many",
+  "readmany",
+  "glob",
+  "grep",
+  "ls",
+  "list_dir",
+  "listdir",
+  "list_directory",
+  "directory_tree",
+  "stat"
+]);
+
+const EXEC_LIKE_TOOL_NAMES = new Set([
+  "exec",
+  "bash",
+  "shell",
+  "terminal",
+  "command"
+]);
+
+const READ_ONLY_EXEC_COMMANDS = new Set([
+  "cat",
+  "diff",
+  "du",
+  "fd",
+  "find",
+  "grep",
+  "head",
+  "less",
+  "ls",
+  "more",
+  "pwd",
+  "rg",
+  "stat",
+  "tail",
+  "tree",
+  "wc",
+  "whereis",
+  "which"
+]);
+
+const NEUTRAL_EXEC_COMMANDS = new Set([
+  "cd",
+  "pushd",
+  "popd",
+  "true"
+]);
+
+const READ_ONLY_GIT_SUBCOMMANDS = new Set([
+  "blame",
+  "branch",
+  "describe",
+  "diff",
+  "grep",
+  "log",
+  "ls-files",
+  "remote",
+  "rev-parse",
+  "show",
+  "status"
+]);
+
+function normalizeToolToken(value) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function findNestedValueByKeys(value, keys, seen = new Set(), depth = 0) {
+  if (!value || typeof value !== "object" || depth > 4 || seen.has(value)) {
+    return null;
+  }
+
+  seen.add(value);
+
+  for (const key of keys) {
+    if (value[key] !== undefined && value[key] !== null && value[key] !== "") {
+      return value[key];
+    }
+  }
+
+  const entries = Array.isArray(value) ? value : Object.values(value);
+
+  for (const entry of entries) {
+    const nested = findNestedValueByKeys(entry, keys, seen, depth + 1);
+    if (nested !== null) {
+      return nested;
+    }
+  }
+
+  return null;
+}
+
+function extractCommandText(params) {
+  if (typeof params === "string") {
+    const normalized = params.trim();
+    return normalized || null;
+  }
+
+  if (!isPlainObject(params) && !Array.isArray(params)) {
+    return null;
+  }
+
+  const command = findNestedValueByKeys(params, ["command", "cmd", "script", "shell", "input", "text"]);
+  return typeof command === "string" && command.trim() ? command.trim() : null;
+}
+
+function splitShellSegments(commandText) {
+  return String(commandText ?? "")
+    .split(/&&|\|\||;|\|/)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+}
+
+function unquoteShellToken(token) {
+  return String(token ?? "").replace(/^['"]|['"]$/g, "");
+}
+
+function tokenizeShellSegment(segment) {
+  return segment.match(/"[^"]+"|'[^']+'|\S+/g)?.map(unquoteShellToken) ?? [];
+}
+
+function stripEnvAssignments(tokens) {
+  let index = 0;
+
+  while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=.*/.test(tokens[index])) {
+    index += 1;
+  }
+
+  return tokens.slice(index);
+}
+
+function resolveGitSubcommand(tokens) {
+  let index = 1;
+
+  while (index < tokens.length) {
+    const token = tokens[index];
+
+    if (["-C", "--git-dir", "--work-tree", "-c"].includes(token)) {
+      index += 2;
+      continue;
+    }
+
+    if (token.startsWith("-")) {
+      index += 1;
+      continue;
+    }
+
+    return normalizeToolToken(token);
+  }
+
+  return "";
+}
+
+function isReadOnlyFindInvocation(tokens) {
+  return !tokens.some((token, index) =>
+    token === "-delete" ||
+    (token === "-exec" && tokens[index + 1] && normalizeToolToken(tokens[index + 1]) !== "echo") ||
+    token === "-execdir" ||
+    token === "-ok" ||
+    token === "-okdir"
+  );
+}
+
+function isReadOnlyExecSegment(segment) {
+  const stripped = stripEnvAssignments(tokenizeShellSegment(segment));
+
+  if (!stripped.length) {
+    return true;
+  }
+
+  const command = normalizeToolToken(stripped[0]);
+
+  if (!command) {
+    return false;
+  }
+
+  if (NEUTRAL_EXEC_COMMANDS.has(command)) {
+    return true;
+  }
+
+  if (command === "git") {
+    return READ_ONLY_GIT_SUBCOMMANDS.has(resolveGitSubcommand(stripped));
+  }
+
+  if (command === "find") {
+    return isReadOnlyFindInvocation(stripped);
+  }
+
+  return READ_ONLY_EXEC_COMMANDS.has(command);
+}
+
+function shouldCreateCheckpointForTool(ctx) {
+  const toolName = normalizeToolToken(ctx?.toolName);
+
+  if (!toolName) {
+    return true;
+  }
+
+  if (READ_ONLY_TOOL_NAMES.has(toolName)) {
+    return false;
+  }
+
+  if (!EXEC_LIKE_TOOL_NAMES.has(toolName)) {
+    return true;
+  }
+
+  const commandText = extractCommandText(ctx?.params);
+
+  if (!commandText) {
+    return true;
+  }
+
+  const segments = splitShellSegments(commandText);
+
+  if (!segments.length) {
+    return true;
+  }
+
+  return !segments.every((segment) => isReadOnlyExecSegment(segment));
+}
+
 function toRollbackStatus(agentId, sessionId, state) {
   return {
     agentId,
@@ -180,6 +410,13 @@ export class StepRollbackPlugin {
       }
     );
 
+    if (!shouldCreateCheckpointForTool(ctx)) {
+      this.logger.info(
+        `[${manifest.id}] skipped checkpoint for read-only tool agent='${ctx.agentId}' session='${ctx.sessionId}' tool='${ctx.toolName}'`
+      );
+      return null;
+    }
+
     const checkpoint = await this.services.checkpointManager.create(ctx);
     this.logger.info(
       `[${manifest.id}] created checkpoint '${checkpoint.checkpointId}' for session '${ctx.sessionId}' before tool '${ctx.toolName}'`
@@ -211,7 +448,7 @@ export class StepRollbackPlugin {
       }
     );
 
-    if (ctx.toolCallId) {
+    if (ctx.toolCallId && shouldCreateCheckpointForTool(ctx)) {
       await this.services.checkpointManager.reconcile(ctx);
     }
 
@@ -319,7 +556,7 @@ export class StepRollbackPlugin {
           targetEntryId: checkpoint.entryId,
           triggeredAt: nowIso(),
           result: "success",
-          message: "rollback completed, waiting for continue"
+          message: "rollback completed"
         });
 
         this.logger.info(
@@ -333,7 +570,7 @@ export class StepRollbackPlugin {
           checkpointId,
           targetEntryId: checkpoint.entryId,
           result: "success",
-          awaitingContinue: true,
+          awaitingContinue: false,
           activeHeadEntryId: checkpoint.entryId
         };
       } catch (error) {
@@ -366,103 +603,97 @@ export class StepRollbackPlugin {
     });
   }
 
-  async continue({ agentId, sessionId, prompt }) {
+  async continue({ agentId, sessionId, checkpointId, prompt, newAgentId, cloneAuth }) {
     this.assertSessionRequest(agentId, sessionId);
     this.logger.info(
-      `[${manifest.id}] continue requested agent='${agentId}' session='${sessionId}' prompt='${prompt ?? "-"}'`
+      `[${manifest.id}] continue requested agent='${agentId}' session='${sessionId}' checkpoint='${checkpointId ?? "-"}' prompt='${prompt ?? "-"}'`
     );
 
-    if (prompt && !this.config.allowContinuePrompt) {
+    ensureCondition(
+      checkpointId,
+      "CHECKPOINT_NOT_FOUND",
+      "checkpointId is required to continue from a checkpoint.",
+      { agentId, sessionId }
+    );
+    ensureCondition(
+      typeof prompt === "string" && prompt.trim(),
+      "ERR_PROMPT_REQUIRED",
+      "continue requires a non-empty prompt.",
+      { agentId, sessionId, checkpointId }
+    );
+
+    if (!this.config.allowContinuePrompt) {
       throw new StepRollbackError(
         "CONTINUE_START_FAILED",
         "Continue prompt is disabled by plugin configuration.",
-        { agentId, sessionId }
+        { agentId, sessionId, checkpointId }
       );
     }
-
-    const state = await this.services.runtimeCursorManager.ensure(agentId, sessionId);
-    ensureCondition(
-      state.awaitingContinue,
-      "NOT_WAITING_CONTINUE",
-      `Session '${sessionId}' is not waiting for continue.`,
-      { agentId, sessionId }
-    );
-    ensureCondition(
-      state.activeHeadEntryId,
-      "ENTRY_NOT_FOUND",
-      `Session '${sessionId}' does not have an active checkpoint entry.`,
-      { agentId, sessionId }
-    );
-    ensureCondition(
-      state.lastRollbackCheckpointId,
-      "CHECKPOINT_NOT_FOUND",
-      `Session '${sessionId}' does not have a rollback checkpoint to continue from.`,
-      { agentId, sessionId }
-    );
-
-    const checkpoint = await this.services.checkpointManager.get(state.lastRollbackCheckpointId);
+    await this.services.runtimeCursorManager.ensure(agentId, sessionId);
+    const checkpoint = checkpointId === "latest"
+      ? (await this.services.checkpointManager.list(agentId, sessionId)).at(-1) ?? null
+      : await this.services.checkpointManager.get(checkpointId);
 
     ensureCondition(
       checkpoint,
       "CHECKPOINT_NOT_FOUND",
-      `Checkpoint '${state.lastRollbackCheckpointId}' was not found.`,
-      { agentId, sessionId, checkpointId: state.lastRollbackCheckpointId }
+      `Checkpoint '${checkpointId}' was not found.`,
+      { agentId, sessionId, checkpointId }
     );
 
-    await this.services.checkpointManager.restore(checkpoint.checkpointId, {
-      restoreWorkspace: true,
-      restoreRuntimeState: false
-    });
+    ensureCondition(
+      checkpoint.agentId === agentId && checkpoint.sessionId === sessionId,
+      "CHECKPOINT_NOT_FOUND",
+      `Checkpoint '${checkpointId}' does not belong to session '${sessionId}'.`,
+      { checkpointId, agentId, sessionId }
+    );
 
     const branchId = await this.services.sequenceStore.next("br");
-    const createdSession = await this.host.createSession({
-      agentId,
+    const forkResult = await this.host.forkContinue({
+      sourceAgentId: agentId,
       sourceSessionId: sessionId,
-      sourceEntryId: state.activeHeadEntryId,
-      checkpointId: checkpoint.checkpointId,
-      branchId,
-      purpose: "continue"
-    });
-    const provisionalSessionId = createdSession?.sessionId ?? crypto.randomUUID();
-    const provisionalSessionKey = createdSession?.sessionKey ?? null;
-
-    const runResult = await this.host.startContinueRun({
-      agentId,
-      sessionId: provisionalSessionId,
-      sessionKey: provisionalSessionKey,
-      entryId: state.activeHeadEntryId,
+      sourceEntryId: checkpoint.entryId,
+      checkpoint,
       prompt,
-      checkpointId: checkpoint.checkpointId,
-      sourceSessionId: sessionId,
-      sourceEntryId: state.activeHeadEntryId,
-      branchId,
-      label: createdSession?.label
+      newAgentId,
+      cloneAuth,
+      branchId
     });
-    const started = runResult === undefined ? true : runResult === true || runResult.started !== false;
 
+    const started = forkResult === undefined ? true : forkResult === true || forkResult.started !== false;
     ensureCondition(
       started,
       "CONTINUE_START_FAILED",
-      `Failed to continue session '${sessionId}' in a branched session.`,
-      { agentId, sessionId }
+      `Failed to fork a new agent from checkpoint '${checkpointId}'.`,
+      { agentId, sessionId, checkpointId, newAgentId }
     );
 
-    const newSessionId = runResult?.sessionId ?? provisionalSessionId;
-    const newSessionKey = runResult?.sessionKey ?? provisionalSessionKey ?? null;
+    const resolvedAgentId = forkResult?.newAgentId ?? newAgentId ?? `${agentId}-cp-${branchId.slice(-4)}`;
+    const resolvedSessionId = forkResult?.newSessionId ?? crypto.randomUUID();
+    const resolvedSessionKey = forkResult?.newSessionKey ?? null;
+    const resolvedWorkspacePath = forkResult?.newWorkspacePath ?? null;
+    const resolvedAgentDir = forkResult?.newAgentDir ?? null;
     const branchRecord = {
       branchId,
+      branchType: "agent",
+      sourceAgentId: agentId,
       sourceSessionId: sessionId,
-      sourceEntryId: state.activeHeadEntryId,
-      newSessionId,
-      newSessionKey,
+      sourceEntryId: checkpoint.entryId,
+      sourceCheckpointId: checkpoint.checkpointId,
+      newAgentId: resolvedAgentId,
+      newWorkspacePath: resolvedWorkspacePath,
+      newAgentDir: resolvedAgentDir,
+      newSessionId: resolvedSessionId,
+      newSessionKey: resolvedSessionKey,
+      prompt,
       createdAt: nowIso(),
       reason: "continue"
     };
 
     await this.services.registry.saveBranch(branchRecord);
-    await this.services.runtimeCursorManager.replace(agentId, newSessionId, {
-      activeHeadEntryId: state.activeHeadEntryId,
-      currentRunId: runResult?.runId ?? null,
+    await this.services.runtimeCursorManager.replace(resolvedAgentId, resolvedSessionId, {
+      activeHeadEntryId: checkpoint.entryId,
+      currentRunId: forkResult?.runId ?? null,
       rollbackInProgress: false,
       awaitingContinue: false,
       lastRollbackCheckpointId: checkpoint.checkpointId
@@ -470,27 +701,33 @@ export class StepRollbackPlugin {
     await this.services.runtimeCursorManager.update(agentId, sessionId, (currentState) => {
       currentState.awaitingContinue = false;
       currentState.rollbackInProgress = false;
-      currentState.lastContinuePrompt = prompt || undefined;
+      currentState.lastContinuePrompt = prompt;
       currentState.currentRunId = null;
       currentState.lastContinuedBranchId = branchId;
-      currentState.lastContinueSessionId = newSessionId;
-      currentState.lastContinueSessionKey = newSessionKey ?? undefined;
+      currentState.lastContinueSessionId = resolvedSessionId;
+      currentState.lastContinueSessionKey = resolvedSessionKey ?? undefined;
       return currentState;
     });
 
     this.logger.info(
-      `[${manifest.id}] continue started from session='${sessionId}' into branch='${branchId}' newSession='${newSessionId}' run='${runResult?.runId ?? "-"}'`
+      `[${manifest.id}] continue forked parentAgent='${agentId}' session='${sessionId}' branch='${branchId}' newAgent='${resolvedAgentId}' newSession='${resolvedSessionId}'`
     );
 
     return {
-      agentId,
-      sourceSessionId: sessionId,
-      sourceEntryId: state.activeHeadEntryId,
+      ok: true,
+      parentAgentId: agentId,
+      parentSessionId: sessionId,
+      sourceEntryId: checkpoint.entryId,
+      checkpointId: checkpoint.checkpointId,
       branchId,
-      newSessionId,
-      newSessionKey,
+      newAgentId: resolvedAgentId,
+      newWorkspacePath: resolvedWorkspacePath,
+      newAgentDir: resolvedAgentDir,
+      newSessionId: resolvedSessionId,
+      newSessionKey: resolvedSessionKey,
       continued: true,
-      usedPrompt: Boolean(prompt)
+      started: forkResult?.started !== false,
+      usedPrompt: true
     };
   }
 

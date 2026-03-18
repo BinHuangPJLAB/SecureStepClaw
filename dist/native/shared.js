@@ -1,5 +1,7 @@
+import path from "node:path";
+
 import { StepRollbackError, toStepRollbackError } from "../core/errors.js";
-import { fileExistsSync, isPlaceholderHomePath, resolveConfig } from "../core/utils.js";
+import { defaultConfig, fileExistsSync, isPlaceholderHomePath, resolveAbsolutePath, resolveConfig } from "../core/utils.js";
 import { manifest } from "../plugin.js";
 
 export function createLogger(api) {
@@ -180,6 +182,102 @@ export function prepareResolvedConfig(rawConfig, logger) {
   }
 
   return resolvedConfig;
+}
+
+export function resolveOpenClawStateDir() {
+  return resolveAbsolutePath(
+    process.env.OPENCLAW_STATE_DIR ||
+    process.env.OPENCLAW_HOME ||
+    "~/.openclaw"
+  );
+}
+
+export function resolveOpenClawConfigPath() {
+  return resolveAbsolutePath(
+    process.env.OPENCLAW_CONFIG_PATH ||
+    path.join(resolveOpenClawStateDir(), "openclaw.json")
+  );
+}
+
+function normalizeSetupBaseDir(baseDir) {
+  const raw = pickNonEmptyString(
+    baseDir,
+    process.env.OPENCLAW_STATE_DIR,
+    process.env.OPENCLAW_HOME,
+    "~/.openclaw"
+  );
+
+  if (!raw) {
+    return "~/.openclaw";
+  }
+
+  return raw.replace(/[\\/]+$/, "") || raw;
+}
+
+function joinSetupPath(baseDir, ...parts) {
+  return [normalizeSetupBaseDir(baseDir), ...parts]
+    .filter(Boolean)
+    .join("/")
+    .replace(/\/+/g, "/");
+}
+
+export function buildSetupPluginConfig(baseDir) {
+  const pluginRoot = joinSetupPath(baseDir, "plugins", manifest.id);
+
+  return {
+    enabled: defaultConfig.enabled,
+    workspaceRoots: [
+      joinSetupPath(baseDir, "workspace")
+    ],
+    checkpointDir: joinSetupPath(pluginRoot, "checkpoints"),
+    registryDir: joinSetupPath(pluginRoot, "registry"),
+    runtimeDir: joinSetupPath(pluginRoot, "runtime"),
+    reportsDir: joinSetupPath(pluginRoot, "reports"),
+    maxCheckpointsPerSession: defaultConfig.maxCheckpointsPerSession,
+    allowContinuePrompt: defaultConfig.allowContinuePrompt,
+    stopRunBeforeRollback: defaultConfig.stopRunBeforeRollback
+  };
+}
+
+export function patchPluginSetupDocument(configDocument, pluginId, pluginConfig) {
+  const nextConfig = structuredClone(
+    configDocument && typeof configDocument === "object" && !Array.isArray(configDocument)
+      ? configDocument
+      : {}
+  );
+  const existingPlugins = nextConfig.plugins && typeof nextConfig.plugins === "object" && !Array.isArray(nextConfig.plugins)
+    ? nextConfig.plugins
+    : {};
+  const existingEntries = existingPlugins.entries && typeof existingPlugins.entries === "object" && !Array.isArray(existingPlugins.entries)
+    ? existingPlugins.entries
+    : {};
+  const existingAllow = Array.isArray(existingPlugins.allow) ? existingPlugins.allow.filter((entry) => typeof entry === "string" && entry.trim()) : [];
+  const nextAllow = existingAllow.includes(pluginId) ? existingAllow : [...existingAllow, pluginId];
+  const previousSnapshot = JSON.stringify(nextConfig);
+
+  nextConfig.plugins = {
+    ...existingPlugins,
+    enabled: true,
+    allow: nextAllow,
+    entries: {
+      ...existingEntries,
+      [pluginId]: {
+        ...(existingEntries[pluginId] && typeof existingEntries[pluginId] === "object" ? existingEntries[pluginId] : {}),
+        enabled: true,
+        config: {
+          ...(existingEntries[pluginId]?.config && typeof existingEntries[pluginId].config === "object"
+            ? existingEntries[pluginId].config
+            : {}),
+          ...pluginConfig
+        }
+      }
+    }
+  };
+
+  return {
+    document: nextConfig,
+    changed: JSON.stringify(nextConfig) !== previousSnapshot
+  };
 }
 
 export function extractGatewayParams(request) {
