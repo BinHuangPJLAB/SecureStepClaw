@@ -1,5 +1,6 @@
 import path from "node:path";
 
+import { updateJsonFile } from "../core/persistence.js";
 import { nowIso, readJson, writeJson } from "../core/utils.js";
 
 function createInitialState(agentId, sessionId, seed = {}) {
@@ -60,14 +61,17 @@ export class RuntimeCursorManager {
   }
 
   async update(agentId, sessionId, updater, seed = {}) {
-    const current = await this.ensure(agentId, sessionId, seed);
-    const nextState = updater(structuredClone(current)) ?? structuredClone(current);
-    nextState.agentId = agentId;
-    nextState.sessionId = sessionId;
-    nextState.updatedAt = nowIso();
-
-    await writeJson(this.filePath(agentId, sessionId), nextState);
-    return nextState;
+    return updateJsonFile(
+      this.filePath(agentId, sessionId),
+      createInitialState(agentId, sessionId, seed),
+      (current) => {
+        const nextState = updater(current) ?? current;
+        nextState.agentId = agentId;
+        nextState.sessionId = sessionId;
+        nextState.updatedAt = nowIso();
+        return nextState;
+      }
+    );
   }
 
   async setActiveHead(agentId, sessionId, entryId) {

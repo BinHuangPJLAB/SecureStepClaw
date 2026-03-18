@@ -1,7 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { ensureDir, nowIso, readJson, removePath, writeJson } from "../core/utils.js";
+import { readJsonRecords, sortTimeline, updateJsonFile } from "../core/persistence.js";
+import { nowIso, readJson, removePath, writeJson } from "../core/utils.js";
 
 function sortCheckpoints(checkpoints) {
   return [...checkpoints].sort((left, right) => {
@@ -10,41 +11,6 @@ function sortCheckpoints(checkpoints) {
     }
 
     return left.createdAt.localeCompare(right.createdAt);
-  });
-}
-
-function timestampValue(value) {
-  const parsed = Date.parse(value ?? "");
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function sortSessionIndexes(indexes) {
-  return [...indexes].sort((left, right) => {
-    const createdDelta = timestampValue(left.createdAt) - timestampValue(right.createdAt);
-
-    if (createdDelta !== 0) {
-      return createdDelta;
-    }
-
-    const updatedDelta = timestampValue(left.updatedAt) - timestampValue(right.updatedAt);
-
-    if (updatedDelta !== 0) {
-      return updatedDelta;
-    }
-
-    return String(left.sessionId ?? "").localeCompare(String(right.sessionId ?? ""));
-  });
-}
-
-function sortBranches(branches) {
-  return [...branches].sort((left, right) => {
-    const createdDelta = timestampValue(left.createdAt) - timestampValue(right.createdAt);
-
-    if (createdDelta !== 0) {
-      return createdDelta;
-    }
-
-    return String(left.branchId ?? "").localeCompare(String(right.branchId ?? ""));
   });
 }
 
@@ -101,26 +67,7 @@ export class CheckpointRegistry {
     const indexes = [];
 
     for (const resolvedAgentId of agentIds) {
-      const agentDir = path.join(sessionsRoot, resolvedAgentId);
-      let entries;
-
-      try {
-        entries = await fs.readdir(agentDir, { withFileTypes: true });
-      } catch (error) {
-        if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-          continue;
-        }
-
-        throw error;
-      }
-
-      for (const entry of entries) {
-        if (!entry.isFile() || !entry.name.endsWith(".json")) {
-          continue;
-        }
-
-        const sessionIndex = await readJson(path.join(agentDir, entry.name), null);
-
+      for (const sessionIndex of await readJsonRecords(path.join(sessionsRoot, resolvedAgentId))) {
         if (!sessionIndex?.sessionId) {
           continue;
         }
@@ -134,28 +81,28 @@ export class CheckpointRegistry {
       }
     }
 
-    return sortSessionIndexes(indexes);
+    return sortTimeline(indexes, ["sessionId"]);
   }
 
   async add(record) {
     await writeJson(this.checkpointFile(record.checkpointId), record);
 
-    const currentIndex = await readJson(this.sessionIndexFile(record.agentId, record.sessionId), {
+    await updateJsonFile(this.sessionIndexFile(record.agentId, record.sessionId), {
       agentId: record.agentId,
       sessionId: record.sessionId,
       createdAt: nowIso(),
       checkpoints: []
+    }, (currentIndex) => {
+      currentIndex.agentId = record.agentId;
+      currentIndex.sessionId = record.sessionId;
+      currentIndex.updatedAt = nowIso();
+      currentIndex.checkpoints = sortCheckpoints([
+        ...currentIndex.checkpoints.filter((item) => item.checkpointId !== record.checkpointId),
+        record
+      ]);
+      return currentIndex;
     });
 
-    currentIndex.agentId = record.agentId;
-    currentIndex.sessionId = record.sessionId;
-    currentIndex.updatedAt = nowIso();
-    currentIndex.checkpoints = sortCheckpoints([
-      ...currentIndex.checkpoints.filter((item) => item.checkpointId !== record.checkpointId),
-      record
-    ]);
-
-    await writeJson(this.sessionIndexFile(record.agentId, record.sessionId), currentIndex);
     return record;
   }
 
@@ -169,18 +116,18 @@ export class CheckpointRegistry {
     const nextRecord = updater(structuredClone(current)) ?? structuredClone(current);
     await writeJson(this.checkpointFile(checkpointId), nextRecord);
 
-    const sessionIndex = await readJson(this.sessionIndexFile(current.agentId, current.sessionId), {
+    await updateJsonFile(this.sessionIndexFile(current.agentId, current.sessionId), {
       agentId: current.agentId,
       sessionId: current.sessionId,
       checkpoints: []
+    }, (sessionIndex) => {
+      sessionIndex.updatedAt = nowIso();
+      sessionIndex.checkpoints = sortCheckpoints(
+        sessionIndex.checkpoints.map((item) => (item.checkpointId === checkpointId ? nextRecord : item))
+      );
+      return sessionIndex;
     });
 
-    sessionIndex.updatedAt = nowIso();
-    sessionIndex.checkpoints = sortCheckpoints(
-      sessionIndex.checkpoints.map((item) => (item.checkpointId === checkpointId ? nextRecord : item))
-    );
-
-    await writeJson(this.sessionIndexFile(current.agentId, current.sessionId), sessionIndex);
     return nextRecord;
   }
 
@@ -193,15 +140,15 @@ export class CheckpointRegistry {
 
     await removePath(this.checkpointFile(checkpointId));
 
-    const sessionIndex = await readJson(this.sessionIndexFile(current.agentId, current.sessionId), {
+    await updateJsonFile(this.sessionIndexFile(current.agentId, current.sessionId), {
       agentId: current.agentId,
       sessionId: current.sessionId,
       checkpoints: []
+    }, (sessionIndex) => {
+      sessionIndex.updatedAt = nowIso();
+      sessionIndex.checkpoints = sessionIndex.checkpoints.filter((item) => item.checkpointId !== checkpointId);
+      return sessionIndex;
     });
-
-    sessionIndex.updatedAt = nowIso();
-    sessionIndex.checkpoints = sessionIndex.checkpoints.filter((item) => item.checkpointId !== checkpointId);
-    await writeJson(this.sessionIndexFile(current.agentId, current.sessionId), sessionIndex);
 
     return current;
   }
@@ -244,7 +191,6 @@ export class CheckpointRegistry {
   }
 
   async saveBranch(record) {
-    await ensureDir(path.dirname(this.branchFile(record.branchId)));
     await writeJson(this.branchFile(record.branchId), record);
     return record;
   }
@@ -254,33 +200,10 @@ export class CheckpointRegistry {
   }
 
   async listBranches() {
-    const branchesRoot = path.join(this.config.registryDir, "branches");
-    let entries;
-
-    try {
-      entries = await fs.readdir(branchesRoot, { withFileTypes: true });
-    } catch (error) {
-      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-        return [];
-      }
-
-      throw error;
-    }
-
-    const records = [];
-
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith(".json")) {
-        continue;
-      }
-
-      const record = await readJson(path.join(branchesRoot, entry.name), null);
-
-      if (record?.branchId) {
-        records.push(record);
-      }
-    }
-
-    return sortBranches(records);
+    return sortTimeline(
+      (await readJsonRecords(path.join(this.config.registryDir, "branches")))
+        .filter((record) => record?.branchId),
+      ["branchId"]
+    );
   }
 }

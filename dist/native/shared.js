@@ -1,8 +1,8 @@
 import path from "node:path";
 
+import { CONFIG_DIRECTORY_KEYS, defaultConfig, manifest } from "../core/contracts.js";
 import { StepRollbackError, toStepRollbackError } from "../core/errors.js";
-import { defaultConfig, fileExistsSync, isPlaceholderHomePath, resolveAbsolutePath, resolveConfig } from "../core/utils.js";
-import { manifest } from "../plugin.js";
+import { fileExistsSync, isPlaceholderHomePath, resolveAbsolutePath, resolveConfig } from "../core/utils.js";
 
 export function createLogger(api) {
   const noop = () => { };
@@ -157,7 +157,7 @@ function findPlaceholderConfigPaths(rawConfig) {
     }
   }
 
-  for (const key of ["checkpointDir", "registryDir", "runtimeDir", "reportsDir"]) {
+  for (const key of CONFIG_DIRECTORY_KEYS) {
     if (isPlaceholderHomePath(rawConfig[key])) {
       warnings.push(`${key} contains placeholder path '${rawConfig[key]}'`);
     }
