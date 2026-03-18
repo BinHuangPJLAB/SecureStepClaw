@@ -660,6 +660,107 @@ test("checks out a session branch from a checkpoint entry", async () => {
   assert.equal(nodes.nodes[0].checkoutAvailable, true);
 });
 
+test("builds checkpoint trees from the default root checkpoint and explicit node ids", async () => {
+  const fixture = await createFixture();
+  const plugin = createStepRollbackPlugin({
+    config: {
+      workspaceRoots: [fixture.workspace],
+      checkpointDir: fixture.checkpointDir,
+      registryDir: fixture.registryDir,
+      runtimeDir: fixture.runtimeDir,
+      reportsDir: fixture.reportsDir
+    },
+    host: {
+      async forkContinue() {
+        return {
+          started: true,
+          runId: "run-tree-child",
+          newAgentId: "main-cp-tree",
+          newSessionId: "session-tree-child",
+          newSessionKey: "agent:main-cp-tree:main",
+          createdNewAgent: true
+        };
+      }
+    }
+  });
+
+  await plugin.hooks.sessionStart({
+    agentId: "main",
+    sessionId: "session-tree-root",
+    runId: "run-tree-root"
+  });
+
+  await fs.writeFile(path.join(fixture.workspace, "tree.txt"), "base\n", "utf8");
+  const firstCheckpoint = await plugin.hooks.beforeToolCall({
+    agentId: "main",
+    sessionId: "session-tree-root",
+    entryId: "entry-tree-1",
+    nodeIndex: 1,
+    toolName: "write",
+    runId: "run-tree-root"
+  });
+
+  await fs.writeFile(path.join(fixture.workspace, "tree.txt"), "next\n", "utf8");
+  const secondCheckpoint = await plugin.hooks.beforeToolCall({
+    agentId: "main",
+    sessionId: "session-tree-root",
+    entryId: "entry-tree-2",
+    nodeIndex: 2,
+    toolName: "write",
+    runId: "run-tree-root"
+  });
+
+  const continueResponse = await plugin.methods["steprollback.continue"]({
+    agentId: "main",
+    sessionId: "session-tree-root",
+    checkpointId: firstCheckpoint.checkpointId,
+    prompt: "Branch from the first checkpoint."
+  });
+
+  await plugin.hooks.sessionStart({
+    agentId: continueResponse.newAgentId,
+    sessionId: continueResponse.newSessionId,
+    runId: "run-tree-child"
+  });
+
+  await fs.writeFile(path.join(fixture.workspace, "tree.txt"), "child\n", "utf8");
+  const childCheckpoint = await plugin.hooks.beforeToolCall({
+    agentId: continueResponse.newAgentId,
+    sessionId: continueResponse.newSessionId,
+    entryId: "entry-tree-child-1",
+    nodeIndex: 1,
+    toolName: "write",
+    runId: "run-tree-child"
+  });
+
+  const defaultTree = await plugin.methods["steprollback.session.tree"]({
+    agentId: "main"
+  });
+
+  assert.equal(defaultTree.root.checkpointId, firstCheckpoint.checkpointId);
+  assert.equal(defaultTree.root.usedDefaultRoot, true);
+  assert.equal(defaultTree.root.resolvedBy, "default");
+  assert.equal(defaultTree.totalNodes, 3);
+  assert.equal(defaultTree.totalSessions, 2);
+  assert.equal(defaultTree.totalBranches, 1);
+  assert.equal(defaultTree.tree.children.length, 2);
+  assert.equal(defaultTree.tree.children[0].checkpointId, secondCheckpoint.checkpointId);
+  assert.equal(defaultTree.tree.children[1].checkpointId, childCheckpoint.checkpointId);
+  assert.equal(defaultTree.tree.children[1].incomingType, "branch");
+  assert.equal(defaultTree.tree.children[1].incomingReason, "continue");
+
+  const explicitTree = await plugin.methods["steprollback.session.tree"]({
+    nodeId: secondCheckpoint.checkpointId
+  });
+
+  assert.equal(explicitTree.root.checkpointId, secondCheckpoint.checkpointId);
+  assert.equal(explicitTree.root.usedDefaultRoot, false);
+  assert.equal(explicitTree.root.resolvedBy, "node");
+  assert.equal(explicitTree.totalNodes, 1);
+  assert.equal(explicitTree.totalBranches, 0);
+  assert.deepEqual(explicitTree.tree.children, []);
+});
+
 test("registers a native OpenClaw plugin and drives rollback through registered hooks and Gateway methods", async () => {
   const fixture = await createFixture();
   const registered = {
@@ -1186,6 +1287,7 @@ test("offers flag-based CLI commands for agents, sessions, rollback, and continu
   assert.match(rootHelp, /setup \[--base-dir <path>\] \[--dry-run\] \[--json\]/);
   assert.match(rootHelp, /status/);
   assert.match(rootHelp, /continue --agent <agentId> --session <sessionId> --checkpoint <checkpointId> --prompt <text> \[--new-agent <agentId>\] \[--clone-auth <mode>\] \[--log\] \[--json\]/);
+  assert.match(rootHelp, /tree \[--agent <agentId>\] \[--session <sessionId>\] \[--node <checkpointId>\] \[--json\]/);
   assert.match(rootHelp, /checkout --agent <agentId> --source-session <sessionId> --entry <entryId> \[--continue\] \[--prompt <text>\] \[--json\]/);
   assert.match(rootHelp, /report --rollback <rollbackId> \[--json\]/);
   assert.match(rootHelp, /branch --branch <branchId> \[--json\]/);
@@ -1290,6 +1392,30 @@ test("offers flag-based CLI commands for agents, sessions, rollback, and continu
     ),
     false
   );
+
+  await registered.hooks.get("session_start").handler({
+    agentId: "main-cp-cli",
+    sessionId: "session-checkout-cli",
+    entryId: "entry-cli-child",
+    runId: "run-cli-child"
+  });
+  await registered.hooks.get("before_tool_call").handler({
+    agentId: "main-cp-cli",
+    sessionId: "session-checkout-cli",
+    entryId: "entry-cli-child",
+    nodeIndex: 1,
+    toolName: "write",
+    runId: "run-cli-child"
+  });
+
+  const treeOutput = await captureConsoleLog(async () => {
+    await cliHarness.commands.get("steprollback tree").action({});
+  });
+  assert.match(treeOutput, /Root:/);
+  assert.match(treeOutput, /Resolved by: default/);
+  assert.match(treeOutput, /session-cli/);
+  assert.match(treeOutput, /session-checkout-cli/);
+  assert.match(treeOutput, /via continue/);
 
   const namedContinueOutput = await captureConsoleLog(async () => {
     await cliHarness.commands.get("steprollback continue").action({

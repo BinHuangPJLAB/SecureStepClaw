@@ -167,6 +167,7 @@ openclaw steprollback checkpoints --agent <agentId> --session <sessionId>
 openclaw steprollback checkpoint --checkpoint <checkpointId>
 openclaw steprollback rollback-status --agent <agentId> --session <sessionId>
 openclaw steprollback nodes --agent <agentId> --session <sessionId>
+openclaw steprollback tree [--agent <agentId>] [--session <sessionId>] [--node <checkpointId>]
 openclaw steprollback report --rollback <rollbackId>
 openclaw steprollback branch --branch <branchId>
 ```

@@ -428,6 +428,70 @@ function printObject(value, options = {}) {
   ]));
 }
 
+function formatTreeNodeLine(node) {
+  const location = `${node?.agentId ?? "-"} / ${node?.sessionId ?? "-"} / node ${node?.nodeIndex ?? "-"}`;
+  const summary = pickNonEmptyString(node?.summary);
+  const edge = node?.incomingType === "branch"
+    ? ` via ${pickNonEmptyString(node?.incomingReason, "branch")}`
+    : "";
+
+  return [
+    node?.checkpointId ?? "-",
+    `[${location}]`,
+    pickNonEmptyString(node?.toolName, "-"),
+    summary ? `- ${summary}` : ""
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .concat(edge);
+}
+
+function renderCheckpointTree(node, prefix = "", isLast = true, isRoot = true) {
+  if (!node) {
+    return "";
+  }
+
+  const connector = isRoot ? "" : isLast ? "\\- " : "|- ";
+  const lines = [`${prefix}${connector}${formatTreeNodeLine(node)}`];
+  const childPrefix = isRoot ? "" : `${prefix}${isLast ? "   " : "|  "}`;
+  const children = Array.isArray(node.children) ? node.children : [];
+
+  children.forEach((child, index) => {
+    lines.push(
+      renderCheckpointTree(
+        child,
+        childPrefix,
+        index === children.length - 1,
+        false
+      )
+    );
+  });
+
+  return lines.filter(Boolean).join("\n");
+}
+
+function printCheckpointTree(result, options = {}) {
+  if (options.json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (!result?.tree) {
+    console.log("No checkpoint tree was found.");
+    return;
+  }
+
+  const lines = [
+    `Root: ${result.root.checkpointId} [${result.root.agentId} / ${result.root.sessionId} / node ${result.root.nodeIndex}]`,
+    `Resolved by: ${result.root.resolvedBy}`,
+    `Nodes: ${result.totalNodes}  Sessions: ${result.totalSessions}  Branches: ${result.totalBranches}`,
+    "",
+    renderCheckpointTree(result.tree)
+  ];
+
+  console.log(lines.join("\n"));
+}
+
 const STEP_ROLLBACK_CLI_OVERVIEW = [
   {
     usage: "setup [--base-dir <path>] [--dry-run] [--json]",
@@ -468,6 +532,10 @@ const STEP_ROLLBACK_CLI_OVERVIEW = [
   {
     usage: "nodes --agent <agentId> --session <sessionId> [--json]",
     description: "List checkpoint-backed nodes for checkout."
+  },
+  {
+    usage: "tree [--agent <agentId>] [--session <sessionId>] [--node <checkpointId>] [--json]",
+    description: "Show checkpoint lineage as a tree."
   },
   {
     usage: "checkout --agent <agentId> --source-session <sessionId> --entry <entryId> [--continue] [--prompt <text>] [--json]",
@@ -963,6 +1031,23 @@ export function registerCli(api, engine, cliMethodInvoker) {
               emptyMessage: `No checkpoint-backed nodes were found for session '${options.session}'.`
             }
           );
+        });
+
+      command
+        .command("tree")
+        .description("Show checkpoint lineage as a tree.")
+        .option("--agent <agentId>", "Root agent id. Defaults to the configured default agent.")
+        .option("--session <sessionId>", "Optional root session id. Defaults to the first root session for the agent.")
+        .option("--node <checkpointId>", "Optional root node id. This is the checkpoint id used as the tree root.")
+        .option("--checkpoint <checkpointId>", "Alias for --node.")
+        .option("--json", "Output raw JSON.")
+        .action(async (options) => {
+          const result = await cliMethodInvoker("steprollback.session.tree", {
+            agentId: normalizeAgentIdInput(api, options.agent),
+            sessionId: options.session,
+            nodeId: pickNonEmptyString(options.node, options.checkpoint)
+          }, readBehavior);
+          printCheckpointTree(result, options);
         });
 
       command
