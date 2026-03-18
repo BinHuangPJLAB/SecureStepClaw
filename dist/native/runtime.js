@@ -48,6 +48,7 @@ const GATEWAY_METHOD_NAMES = [
   "steprollback.rollback.status",
   "steprollback.reports.get",
   "steprollback.session.nodes.list",
+  "steprollback.session.tree",
   "steprollback.session.checkout",
   "steprollback.session.branch.get"
 ];
