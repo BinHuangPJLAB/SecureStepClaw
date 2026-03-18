@@ -1,10 +1,36 @@
 import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 
 import { StepRollbackError } from "../core/errors.js";
+import { ensureDir, nowIso, pathExists, readJson, removePath, resolveAbsolutePath, writeJson } from "../core/utils.js";
 import { manifest } from "../plugin.js";
 import { invokeAgentViaCli } from "./cli.js";
-import { buildBranchSessionKey, buildBranchSessionLabel, normalizeExternalParams, resolveSessionRecord, resolveSessionRecordEventually, resolveToolHookContext } from "./sessions.js";
-import { callFirstHelper, callGatewayMethod, extractGatewayParams, normalizeHookContext, toNativeErrorPayload, unwrapRpcResult } from "./shared.js";
+import {
+  buildAgentSessionKey,
+  buildBranchSessionKey,
+  buildBranchSessionLabel,
+  normalizeAgentIdInput,
+  normalizeExternalParams,
+  readSessionIndexState,
+  readSessionTranscriptEntries,
+  resolveSessionRecord,
+  resolveSessionRecordEventually,
+  resolveToolHookContext,
+  upsertSessionRecord,
+  writeSessionTranscriptEntries
+} from "./sessions.js";
+import {
+  callFirstHelper,
+  callGatewayMethod,
+  extractGatewayParams,
+  normalizeHookContext,
+  pickNonEmptyString,
+  resolveOpenClawConfigPath,
+  resolveOpenClawStateDir,
+  toNativeErrorPayload,
+  unwrapRpcResult
+} from "./shared.js";
 
 const HOOK_BINDINGS = [
   { hookName: "session_start", handlerName: "sessionStart", kind: "session" },
@@ -26,8 +52,420 @@ const GATEWAY_METHOD_NAMES = [
   "steprollback.session.branch.get"
 ];
 
-export function createNativeHostBridge(api, logger, options = {}) {
+const OMITTED_AUTH_KEYS = new Set([
+  "auth",
+  "token",
+  "tokens",
+  "password",
+  "passwords",
+  "apiKey",
+  "apiKeys",
+  "headers",
+  "header",
+  "secret",
+  "secrets"
+]);
+
+const ALLOWED_AGENT_OVERRIDE_KEYS = [
+  "model",
+  "params",
+  "identity",
+  "groupChat",
+  "sandbox",
+  "tools",
+  "runtime",
+  "heartbeat"
+];
+
+const ALLOWED_SUBAGENT_KEYS = [
+  "allowAgents"
+];
+
+const LEGACY_AGENT_DEFAULT_KEYS = [
+  "models",
+  "compaction",
+  "maxConcurrent"
+];
+
+function sanitizeAgentToken(value, fallback = "agent") {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return normalized || fallback;
+}
+
+function resolvePluginStateRoot(config) {
+  return path.dirname(config?.checkpointDir ?? resolveAbsolutePath("~/.openclaw/plugins/step-rollback/checkpoints"));
+}
+
+function resolveForkWorkspacePath(config, agentId) {
+  return path.join(resolvePluginStateRoot(config), "workspaces", agentId);
+}
+
+function resolveAgentDirectory(agentId) {
+  return path.join(resolveOpenClawStateDir(), "agents", agentId);
+}
+
+function resolveConfiguredWorkspace(entry) {
+  return pickNonEmptyString(entry?.workspace, entry?.workspaceRoot, entry?.cwd, entry?.root);
+}
+
+function sanitizeSubagentConfig(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const sanitized = {};
+
+  for (const key of ALLOWED_SUBAGENT_KEYS) {
+    if (value[key] !== undefined) {
+      sanitized[key] = structuredClone(value[key]);
+    }
+  }
+
+  return Object.keys(sanitized).length > 0 ? sanitized : null;
+}
+
+function sanitizeConfiguredAgentEntry(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    return null;
+  }
+
+  const sanitized = {};
+  const workspace = resolveConfiguredWorkspace(entry);
+  const agentId = pickNonEmptyString(entry.id);
+  const agentName = pickNonEmptyString(entry.name, agentId);
+
+  if (agentId) {
+    sanitized.id = agentId;
+  }
+
+  if (entry.default === true) {
+    sanitized.default = true;
+  }
+
+  if (agentName) {
+    sanitized.name = agentName;
+  }
+
+  if (workspace) {
+    sanitized.workspace = workspace;
+  }
+
+  if (pickNonEmptyString(entry.agentDir)) {
+    sanitized.agentDir = entry.agentDir;
+  }
+
+  for (const key of ALLOWED_AGENT_OVERRIDE_KEYS) {
+    if (entry[key] !== undefined) {
+      sanitized[key] = structuredClone(entry[key]);
+    }
+  }
+
+  const sanitizedSubagents = sanitizeSubagentConfig(entry.subagents);
+
+  if (sanitizedSubagents) {
+    sanitized.subagents = sanitizedSubagents;
+  }
+
+  return Object.keys(sanitized).length > 0 ? sanitized : null;
+}
+
+function cloneAgentEntryForFork(parentEntry, { newAgentId, newWorkspacePath, newAgentDir, cloneAuth }) {
+  const sourceEntry = parentEntry && typeof parentEntry === "object" ? structuredClone(parentEntry) : {};
+  const nextEntry = {
+    id: newAgentId,
+    name: newAgentId,
+    workspace: newWorkspacePath,
+    agentDir: newAgentDir
+  };
+
+  for (const key of ALLOWED_AGENT_OVERRIDE_KEYS) {
+    const value = sourceEntry[key];
+    if (value !== undefined) {
+      nextEntry[key] = structuredClone(value);
+    }
+  }
+
+  const sanitizedSubagents = sanitizeSubagentConfig(sourceEntry.subagents);
+
+  if (sanitizedSubagents) {
+    nextEntry.subagents = sanitizedSubagents;
+  }
+
+  if (cloneAuth === "never") {
+    for (const key of OMITTED_AUTH_KEYS) {
+      delete nextEntry[key];
+    }
+  }
+
+  return nextEntry;
+}
+
+function isPluginManagedForkEntry(entry) {
+  if (!entry || typeof entry !== "object") {
+    return false;
+  }
+
+  const workspace = pickNonEmptyString(entry.workspace);
+  const agentId = pickNonEmptyString(entry.id);
+
+  return workspace.includes("/plugins/step-rollback/workspaces/") || /-cp-\d+$/i.test(agentId);
+}
+
+function sanitizeListAgentEntry(entry) {
+  if (!isPluginManagedForkEntry(entry)) {
+    return sanitizeConfiguredAgentEntry(entry);
+  }
+
+  return cloneAgentEntryForFork(entry, {
+    newAgentId: entry.id,
+    newWorkspacePath: resolveConfiguredWorkspace(entry),
+    newAgentDir: entry.agentDir,
+    cloneAuth: "auto"
+  });
+}
+
+function repairConfiguredAgentEntries(entries, defaultsEntry) {
+  const hadDefaults = defaultsEntry && typeof defaultsEntry === "object" && !Array.isArray(defaultsEntry);
+  const nextDefaults = hadDefaults ? structuredClone(defaultsEntry) : {};
+  const repairedEntries = [];
+
+  for (const [index, entry] of (entries ?? []).entries()) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      continue;
+    }
+
+    if (entry.default === true || index === 0 || entry.id === "main") {
+      for (const key of LEGACY_AGENT_DEFAULT_KEYS) {
+        if (entry[key] !== undefined && nextDefaults[key] === undefined) {
+          nextDefaults[key] = structuredClone(entry[key]);
+        }
+      }
+    }
+
+    const sanitized = sanitizeListAgentEntry(entry);
+
+    if (sanitized) {
+      repairedEntries.push(sanitized);
+    }
+  }
+
   return {
+    entries: repairedEntries,
+    defaults: hadDefaults || Object.keys(nextDefaults).length > 0 ? nextDefaults : undefined
+  };
+}
+
+function resolveParentAgentEntry(api, agentId) {
+  const normalizedAgentId = normalizeAgentIdInput(api, agentId);
+  const agentsConfig = api?.config?.agents;
+
+  if (Array.isArray(agentsConfig?.list)) {
+    const match = agentsConfig.list.find((entry) => entry && typeof entry === "object" && entry.id === normalizedAgentId);
+    if (match) {
+      return { entry: match, shape: "list" };
+    }
+  }
+
+  if (Array.isArray(agentsConfig?.entries)) {
+    const match = agentsConfig.entries.find((entry) => entry && typeof entry === "object" && entry.id === normalizedAgentId);
+    if (match) {
+      return { entry: match, shape: "entries" };
+    }
+  }
+
+  if (agentsConfig && typeof agentsConfig === "object" && !Array.isArray(agentsConfig)) {
+    if (agentsConfig[normalizedAgentId] && typeof agentsConfig[normalizedAgentId] === "object") {
+      return { entry: agentsConfig[normalizedAgentId], shape: "object" };
+    }
+
+    const defaultAgentId = normalizeAgentIdInput(api, "default");
+    if (normalizedAgentId === defaultAgentId && agentsConfig.defaults && typeof agentsConfig.defaults === "object") {
+      return { entry: agentsConfig.defaults, shape: "defaults" };
+    }
+  }
+
+  return {
+    entry: {
+      id: normalizedAgentId,
+      name: normalizedAgentId
+    },
+    shape: "generated"
+  };
+}
+
+function collectLegacyAgentEntries(agentsConfig) {
+  if (!agentsConfig || typeof agentsConfig !== "object" || Array.isArray(agentsConfig)) {
+    return [];
+  }
+
+  return Object.entries(agentsConfig)
+    .filter(([key, value]) =>
+      !["defaults", "list", "entries"].includes(key) &&
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value)
+    )
+    .map(([key, value]) => ({
+      ...value,
+      id: typeof value.id === "string" && value.id.trim() ? value.id : key
+    }));
+}
+
+function hasConfiguredAgent(api, configDocument, agentId) {
+  const normalizedAgentId = sanitizeAgentToken(agentId, "agent");
+  const agentsConfig = configDocument?.agents ?? api?.config?.agents;
+
+  if (Array.isArray(agentsConfig?.list)) {
+    return agentsConfig.list.some((entry) => entry && typeof entry === "object" && entry.id === normalizedAgentId);
+  }
+
+  if (Array.isArray(agentsConfig?.entries)) {
+    return agentsConfig.entries.some((entry) => entry && typeof entry === "object" && entry.id === normalizedAgentId);
+  }
+
+  if (agentsConfig && typeof agentsConfig === "object") {
+    if (Boolean(agentsConfig[normalizedAgentId])) {
+      return true;
+    }
+
+    return collectLegacyAgentEntries(agentsConfig).some((entry) => entry.id === normalizedAgentId);
+  }
+
+  return false;
+}
+
+function patchConfigWithForkedAgent(configDocument, agentId, agentEntry) {
+  const nextConfig = structuredClone(configDocument ?? {});
+  const nextAgents = nextConfig.agents && typeof nextConfig.agents === "object" && !Array.isArray(nextConfig.agents)
+    ? nextConfig.agents
+    : {};
+  const legacyEntries = collectLegacyAgentEntries(nextAgents);
+  const normalizedLegacyEntries = legacyEntries.filter((entry) => entry.id !== agentId);
+  const sanitizedAgentEntry = sanitizeConfiguredAgentEntry({
+    ...agentEntry,
+    id: agentId,
+    name: pickNonEmptyString(agentEntry?.name, agentId)
+  }) ?? {
+    ...agentEntry,
+    id: agentId
+  };
+
+  if (Array.isArray(nextAgents?.list)) {
+    const repaired = repairConfiguredAgentEntries(nextAgents.list, nextAgents.defaults);
+
+    nextAgents.list = [
+      ...repaired.entries.filter((entry) => entry?.id !== agentId),
+      sanitizedAgentEntry
+    ];
+
+    if (repaired.defaults !== undefined) {
+      nextAgents.defaults = repaired.defaults;
+    }
+
+    return nextConfig;
+  }
+
+  if (Array.isArray(nextAgents?.entries)) {
+    const repaired = repairConfiguredAgentEntries(nextAgents.entries, nextAgents.defaults);
+
+    nextAgents.entries = [
+      ...repaired.entries.filter((entry) => entry?.id !== agentId),
+      sanitizedAgentEntry
+    ];
+
+    if (repaired.defaults !== undefined) {
+      nextAgents.defaults = repaired.defaults;
+    }
+
+    return nextConfig;
+  }
+
+  const repaired = repairConfiguredAgentEntries(normalizedLegacyEntries, nextAgents.defaults);
+
+  nextConfig.agents = {
+    ...nextAgents,
+    ...(repaired.defaults !== undefined ? { defaults: repaired.defaults } : {}),
+    list: [
+      ...repaired.entries,
+      sanitizedAgentEntry
+    ]
+  };
+
+  for (const key of Object.keys(nextConfig.agents)) {
+    if (!["defaults", "list", "entries"].includes(key) && typeof nextConfig.agents[key] === "object") {
+      delete nextConfig.agents[key];
+    }
+  }
+
+  return nextConfig;
+}
+
+function syncApiConfig(api, nextConfig) {
+  if (!api) {
+    return;
+  }
+
+  if (!api.config || typeof api.config !== "object") {
+    api.config = nextConfig;
+    return;
+  }
+
+  for (const key of Object.keys(api.config)) {
+    if (!(key in nextConfig)) {
+      delete api.config[key];
+    }
+  }
+
+  Object.assign(api.config, nextConfig);
+}
+
+async function loadCheckpointTranscriptPrefix(api, checkpoint) {
+  const snapshotInfo = checkpoint?.transcriptSnapshot;
+  const snapshotFile = snapshotInfo?.included && snapshotInfo?.fileName
+    ? path.join(checkpoint.snapshotRef, snapshotInfo.fileName)
+    : path.join(checkpoint.snapshotRef, "transcript-prefix.jsonl");
+
+  if (await pathExists(snapshotFile)) {
+    const contents = await fs.readFile(snapshotFile, "utf8");
+    return contents
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  }
+
+  const transcript = await readSessionTranscriptEntries(api, checkpoint.agentId, checkpoint.sessionId);
+  const prefix = [];
+
+  for (const entry of transcript.entries) {
+    prefix.push(entry);
+
+    if (entry?.id === checkpoint.entryId) {
+      return prefix;
+    }
+  }
+
+  throw new StepRollbackError(
+    "ERR_SESSION_REBUILD_FAILED",
+    `Could not rebuild transcript prefix for checkpoint '${checkpoint.checkpointId}'.`,
+    {
+      checkpointId: checkpoint.checkpointId,
+      agentId: checkpoint.agentId,
+      sessionId: checkpoint.sessionId,
+      entryId: checkpoint.entryId
+    }
+  );
+}
+
+export function createNativeHostBridge(api, logger, options = {}) {
+  const resolvedPluginConfig = options.config ?? {};
+  const getEngine = typeof options.getEngine === "function" ? options.getEngine : () => null;
+  const bridge = {
     async stopRun({ agentId, sessionId, runId }) {
       const directResult = await callFirstHelper(api, [
         ["runtime", "agent", "stopRun"],
@@ -80,6 +518,22 @@ export function createNativeHostBridge(api, logger, options = {}) {
       const syntheticMessage = prompt?.trim() || "Continue from the restored checkpoint.";
       const branchLabel = label ?? buildBranchSessionLabel(sourceSessionId ?? targetSessionId ?? "session", branchId ?? "continue");
 
+      try {
+        return await invokeAgentViaCli(api, logger, {
+          ...options,
+          agentId,
+          sessionId: targetSessionId,
+          prompt: syntheticMessage,
+          sourceSessionId: sourceSessionId ?? targetSessionId,
+          branchId,
+          label: branchLabel
+        });
+      } catch (error) {
+        logger.warn?.(
+          `[${manifest.id}] openclaw agent continuation fallback failed for sourceSession='${sourceSessionId ?? targetSessionId ?? "-"}': ${error instanceof Error ? error.message : error}`
+        );
+      }
+
       if (targetSessionKey && typeof api?.runtime?.subagent?.run === "function") {
         try {
           const subagentResult = await api.runtime.subagent.run({
@@ -104,21 +558,6 @@ export function createNativeHostBridge(api, logger, options = {}) {
             `[${manifest.id}] runtime.subagent.run could not continue branch session '${targetSessionKey}': ${error instanceof Error ? error.message : error}`
           );
         }
-      }
-
-      try {
-        return await invokeAgentViaCli(api, logger, {
-          ...options,
-          agentId,
-          prompt: syntheticMessage,
-          sourceSessionId: sourceSessionId ?? targetSessionId,
-          branchId,
-          label: branchLabel
-        });
-      } catch (error) {
-        logger.warn?.(
-          `[${manifest.id}] openclaw agent continuation fallback failed for sourceSession='${sourceSessionId ?? targetSessionId ?? "-"}': ${error instanceof Error ? error.message : error}`
-        );
       }
 
       const rpcResult = await callGatewayMethod(api, "agent", {
@@ -198,8 +637,186 @@ export function createNativeHostBridge(api, logger, options = {}) {
         label: buildBranchSessionLabel(sourceSessionId, branchId ?? "branch"),
         assumed: true
       };
+    },
+
+    async forkContinue({ sourceAgentId, sourceSessionId, checkpoint, prompt, newAgentId, cloneAuth, branchId }) {
+      const engine = getEngine();
+      if (!engine?.services?.checkpointManager) {
+        throw new StepRollbackError(
+          "CONTINUE_START_FAILED",
+          "Step Rollback could not access its runtime services while forking a child agent.",
+          { sourceAgentId, sourceSessionId, checkpointId: checkpoint?.checkpointId }
+        );
+      }
+
+      const childAgentId = sanitizeAgentToken(
+        pickNonEmptyString(newAgentId) || `${sourceAgentId}-cp-${String(branchId ?? crypto.randomUUID()).slice(-4)}`,
+        "agent"
+      );
+      const configPath = resolveOpenClawConfigPath();
+      const configDocument = await readJson(configPath, api?.config ?? {});
+      const childWorkspacePath = resolveForkWorkspacePath(resolvedPluginConfig, childAgentId);
+      const childAgentDir = resolveAgentDirectory(childAgentId);
+      const childSessionId = crypto.randomUUID();
+      const childSessionKey = buildAgentSessionKey(childAgentId);
+      const childLabel = buildBranchSessionLabel(sourceSessionId, branchId ?? "continue");
+      const parentSessionIndex = await readSessionIndexState(api, sourceAgentId);
+      const transcriptPrefix = await loadCheckpointTranscriptPrefix(api, checkpoint);
+      let configWritten = false;
+
+      if (hasConfiguredAgent(api, configDocument, childAgentId)) {
+        throw new StepRollbackError(
+          "ERR_AGENT_ALREADY_EXISTS",
+          `Agent '${childAgentId}' already exists.`,
+          {
+            sourceAgentId,
+            sourceSessionId,
+            checkpointId: checkpoint?.checkpointId,
+            newAgentId: childAgentId
+          }
+        );
+      }
+
+      if (await pathExists(childWorkspacePath)) {
+        throw new StepRollbackError(
+          "ERR_AGENT_ALREADY_EXISTS",
+          `Workspace '${childWorkspacePath}' already exists for agent '${childAgentId}'.`,
+          {
+            sourceAgentId,
+            sourceSessionId,
+            checkpointId: checkpoint?.checkpointId,
+            newAgentId: childAgentId,
+            newWorkspacePath: childWorkspacePath
+          }
+        );
+      }
+
+      if (await pathExists(childAgentDir)) {
+        throw new StepRollbackError(
+          "ERR_AGENT_ALREADY_EXISTS",
+          `Agent directory '${childAgentDir}' already exists for agent '${childAgentId}'.`,
+          {
+            sourceAgentId,
+            sourceSessionId,
+            checkpointId: checkpoint?.checkpointId,
+            newAgentId: childAgentId,
+            newAgentDir: childAgentDir
+          }
+        );
+      }
+
+      try {
+        await ensureDir(childAgentDir);
+        await ensureDir(path.join(childAgentDir, "sessions"));
+
+        await engine.services.checkpointManager.materialize(checkpoint.checkpointId, {
+          resolveTargetPath(entry, index) {
+            if (entry.targetPath === checkpoint.workspaceSnapshots?.[0]?.targetPath) {
+              return childWorkspacePath;
+            }
+
+            if (entry.targetPath === engine.config.workspaceRoots[0]) {
+              return childWorkspacePath;
+            }
+
+            return path.join(childWorkspacePath, "__roots__", `${index + 1}-${path.basename(entry.targetPath || "root")}`);
+          }
+        });
+
+        await writeSessionTranscriptEntries(api, childAgentId, childSessionId, transcriptPrefix);
+        await upsertSessionRecord(api, childAgentId, {
+          sessionId: childSessionId,
+          sessionKey: childSessionKey,
+          label: childLabel,
+          createdAt: nowIso(),
+          updatedAt: nowIso(),
+          branchOf: sourceSessionId
+        }, {
+          shape: Array.isArray(parentSessionIndex.contents) ? "array" : "object"
+        });
+
+        const parentAgent = resolveParentAgentEntry(api, sourceAgentId);
+        const childAgentEntry = cloneAgentEntryForFork(parentAgent.entry, {
+          newAgentId: childAgentId,
+          newWorkspacePath: childWorkspacePath,
+          newAgentDir: childAgentDir,
+          cloneAuth: pickNonEmptyString(cloneAuth).toLowerCase() || "auto"
+        });
+        const nextConfig = patchConfigWithForkedAgent(configDocument, childAgentId, childAgentEntry);
+
+        await writeJson(configPath, nextConfig);
+        syncApiConfig(api, nextConfig);
+        configWritten = true;
+
+        let runResult = null;
+
+        try {
+          runResult = await invokeAgentViaCli(api, logger, {
+            ...options,
+            agentId: childAgentId,
+            sessionId: childSessionId,
+            prompt
+          });
+        } catch (error) {
+          logger.warn?.(
+            `[${manifest.id}] openclaw agent launch fallback failed for child agent '${childAgentId}': ${error instanceof Error ? error.message : error}`
+          );
+        }
+
+        if (!runResult && typeof api?.runtime?.subagent?.run === "function") {
+          try {
+            const subagentResult = await api.runtime.subagent.run({
+              sessionKey: childSessionKey,
+              message: prompt,
+              deliver: false
+            });
+            runResult = {
+              started: true,
+              runId: subagentResult?.runId ?? null,
+              sessionId: childSessionId,
+              sessionKey: childSessionKey
+            };
+          } catch (error) {
+            logger.warn?.(
+              `[${manifest.id}] runtime.subagent.run could not launch child agent '${childAgentId}': ${error instanceof Error ? error.message : error}`
+            );
+          }
+        }
+
+        return {
+          started: runResult?.started !== false,
+          runId: runResult?.runId ?? null,
+          newAgentId: childAgentId,
+          newWorkspacePath: childWorkspacePath,
+          newAgentDir: childAgentDir,
+          newSessionId: runResult?.sessionId ?? childSessionId,
+          newSessionKey: runResult?.sessionKey ?? childSessionKey
+        };
+      } catch (error) {
+        if (!configWritten) {
+          await removePath(childWorkspacePath).catch(() => {});
+          await removePath(childAgentDir).catch(() => {});
+        }
+
+        if (error instanceof StepRollbackError) {
+          throw error;
+        }
+
+        throw new StepRollbackError(
+          "ERR_WORKSPACE_MATERIALIZE_FAILED",
+          `Failed to fork child agent '${childAgentId}' from checkpoint '${checkpoint?.checkpointId ?? "-"}'. ${error instanceof Error ? error.message : error}`,
+          {
+            sourceAgentId,
+            sourceSessionId,
+            checkpointId: checkpoint?.checkpointId,
+            newAgentId: childAgentId
+          }
+        );
+      }
     }
   };
+
+  return bridge;
 }
 
 export function registerGatewayMethods(api, engine, logger) {

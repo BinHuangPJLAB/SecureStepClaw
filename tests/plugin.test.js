@@ -14,17 +14,24 @@ async function createFixture() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "secure-step-claw-"));
   const workspace = path.join(root, "workspace");
   const pluginRoot = path.join(root, "plugin-data");
+  const configPath = path.join(root, "openclaw.json");
 
   await fs.mkdir(workspace, { recursive: true });
 
   return {
     root,
+    configPath,
     workspace,
     checkpointDir: path.join(pluginRoot, "checkpoints"),
     registryDir: path.join(pluginRoot, "registry"),
     runtimeDir: path.join(pluginRoot, "runtime"),
     reportsDir: path.join(pluginRoot, "reports")
   };
+}
+
+async function writeOpenClawConfig(filePath, value) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
 async function writeSessionTranscript(root, agentId, sessionId, entries) {
@@ -150,8 +157,7 @@ test("creates checkpoints, rolls back workspace state, and continues from the ch
   const fixture = await createFixture();
   const calls = {
     stopRun: [],
-    createSession: [],
-    continueRun: []
+    forkContinue: []
   };
 
   const plugin = createStepRollbackPlugin({
@@ -167,19 +173,16 @@ test("creates checkpoints, rolls back workspace state, and continues from the ch
         calls.stopRun.push(input);
         return { stopped: true };
       },
-      async createSession(input) {
-        calls.createSession.push(input);
+      async forkContinue(input) {
+        calls.forkContinue.push(input);
         return {
-          sessionId: "session-branch-1",
-          sessionKey: "agent:main:direct:step-rollback-br_0001"
-        };
-      },
-      async startContinueRun(input) {
-        calls.continueRun.push(input);
-        return {
-          runId: `continued:${input.sessionId}:${input.entryId}`,
-          sessionId: input.sessionId,
-          sessionKey: input.sessionKey
+          started: true,
+          runId: "run-child-1",
+          newAgentId: "main-cp-0001",
+          newWorkspacePath: path.join(fixture.root, "forks", "main-cp-0001"),
+          newAgentDir: path.join(fixture.root, "agents", "main-cp-0001"),
+          newSessionId: "session-child-1",
+          newSessionKey: "agent:main-cp-0001:main"
         };
       }
     }
@@ -234,7 +237,7 @@ test("creates checkpoints, rolls back workspace state, and continues from the ch
   });
 
   assert.equal(rollbackResponse.result, "success");
-  assert.equal(rollbackResponse.awaitingContinue, true);
+  assert.equal(rollbackResponse.awaitingContinue, false);
   assert.equal(await fs.readFile(path.join(fixture.workspace, "app.txt"), "utf8"), "v1\n");
   assert.equal(calls.stopRun.length, 1);
 
@@ -243,45 +246,48 @@ test("creates checkpoints, rolls back workspace state, and continues from the ch
     sessionId: "session-1"
   });
 
-  assert.equal(rollbackStatus.awaitingContinue, true);
+  assert.equal(rollbackStatus.awaitingContinue, false);
   assert.equal(rollbackStatus.activeHeadEntryId, "entry-1");
 
   const continueResponse = await plugin.methods["steprollback.continue"]({
     agentId: "main",
     sessionId: "session-1",
+    checkpointId: listResponse.checkpoints[0].checkpointId,
     prompt: "Retry, but inspect dependencies first."
   });
 
   assert.equal(continueResponse.continued, true);
   assert.equal(continueResponse.usedPrompt, true);
-  assert.equal(continueResponse.newSessionId, "session-branch-1");
-  assert.equal(continueResponse.newSessionKey, "agent:main:direct:step-rollback-br_0001");
-  assert.equal(calls.createSession.length, 1);
-  assert.equal(calls.continueRun.length, 1);
-  assert.equal(calls.continueRun[0].entryId, "entry-1");
-  assert.equal(calls.continueRun[0].sessionId, "session-branch-1");
-  assert.equal(calls.continueRun[0].sessionKey, "agent:main:direct:step-rollback-br_0001");
+  assert.equal(continueResponse.newAgentId, "main-cp-0001");
+  assert.equal(continueResponse.newSessionId, "session-child-1");
+  assert.equal(continueResponse.newSessionKey, "agent:main-cp-0001:main");
+  assert.equal(calls.forkContinue.length, 1);
+  assert.equal(calls.forkContinue[0].sourceEntryId, "entry-1");
+  assert.equal(calls.forkContinue[0].checkpoint.checkpointId, listResponse.checkpoints[0].checkpointId);
+  assert.equal(calls.forkContinue[0].prompt, "Retry, but inspect dependencies first.");
 
   const report = await plugin.methods["steprollback.reports.get"]({
     rollbackId: rollbackResponse.rollbackId
   });
 
   assert.equal(report.result, "success");
-  assert.match(report.message, /waiting for continue/);
+  assert.match(report.message, /rollback completed/);
 
   const finalState = await plugin.services.runtimeCursorManager.get("main", "session-1");
   assert.equal(finalState.awaitingContinue, false);
   assert.equal(finalState.currentRunId, null);
-  assert.equal(finalState.lastContinueSessionId, "session-branch-1");
+  assert.equal(finalState.lastContinueSessionId, "session-child-1");
 
-  const branchedState = await plugin.services.runtimeCursorManager.get("main", "session-branch-1");
-  assert.equal(branchedState.currentRunId, "continued:session-branch-1:entry-1");
+  const branchedState = await plugin.services.runtimeCursorManager.get("main-cp-0001", "session-child-1");
+  assert.equal(branchedState.currentRunId, "run-child-1");
 
   const branch = await plugin.methods["steprollback.session.branch.get"]({
     branchId: continueResponse.branchId
   });
+  assert.equal(branch.branchType, "agent");
   assert.equal(branch.sourceSessionId, "session-1");
-  assert.equal(branch.newSessionId, "session-branch-1");
+  assert.equal(branch.newAgentId, "main-cp-0001");
+  assert.equal(branch.newSessionId, "session-child-1");
 });
 
 test("builds checkpoint summaries from tool targets and exec commands", async () => {
@@ -338,6 +344,90 @@ test("builds checkpoint summaries from tool targets and exec commands", async ()
 
   assert.equal(checkpoints[0].summary, "before tool write overview.txt");
   assert.equal(checkpoints[1].summary, "before tool exec delete report.pdf");
+});
+
+test("skips checkpoints for read-only tools and read-only exec commands", async () => {
+  const fixture = await createFixture();
+  const plugin = createStepRollbackPlugin({
+    config: {
+      workspaceRoots: [fixture.workspace],
+      checkpointDir: fixture.checkpointDir,
+      registryDir: fixture.registryDir,
+      runtimeDir: fixture.runtimeDir,
+      reportsDir: fixture.reportsDir
+    }
+  });
+
+  await plugin.hooks.sessionStart({
+    agentId: "main",
+    sessionId: "session-filtered",
+    runId: "run-filtered"
+  });
+
+  const readCheckpoint = await plugin.hooks.beforeToolCall({
+    agentId: "main",
+    sessionId: "session-filtered",
+    entryId: "entry-read",
+    nodeIndex: 1,
+    toolName: "read",
+    runId: "run-filtered",
+    params: {
+      file_path: path.join(fixture.workspace, "notes.txt")
+    }
+  });
+
+  const listCheckpoint = await plugin.hooks.beforeToolCall({
+    agentId: "main",
+    sessionId: "session-filtered",
+    entryId: "entry-list",
+    nodeIndex: 2,
+    toolName: "exec",
+    runId: "run-filtered",
+    params: {
+      command: `cd ${fixture.workspace} && git status`
+    }
+  });
+
+  const findCheckpoint = await plugin.hooks.beforeToolCall({
+    agentId: "main",
+    sessionId: "session-filtered",
+    entryId: "entry-find",
+    nodeIndex: 3,
+    toolName: "exec",
+    runId: "run-filtered",
+    params: {
+      command: `find ${fixture.workspace} -type f -maxdepth 2`
+    }
+  });
+
+  await fs.writeFile(path.join(fixture.workspace, "notes.txt"), "v1\n", "utf8");
+
+  const writeCheckpoint = await plugin.hooks.beforeToolCall({
+    agentId: "main",
+    sessionId: "session-filtered",
+    entryId: "entry-write",
+    nodeIndex: 4,
+    toolName: "write",
+    runId: "run-filtered",
+    params: {
+      file_path: path.join(fixture.workspace, "notes.txt"),
+      content: "v2\n"
+    }
+  });
+
+  assert.equal(readCheckpoint, null);
+  assert.equal(listCheckpoint, null);
+  assert.equal(findCheckpoint, null);
+  assert.ok(writeCheckpoint);
+
+  const { checkpoints } = await plugin.methods["steprollback.checkpoints.list"]({
+    agentId: "main",
+    sessionId: "session-filtered"
+  });
+
+  assert.equal(checkpoints.length, 1);
+  assert.equal(checkpoints[0].entryId, "entry-write");
+  assert.equal(checkpoints[0].summary, "before tool write notes.txt");
 });
 
 test("resolves relative paths even when process cwd is unavailable", () => {
@@ -565,6 +655,16 @@ test("registers a native OpenClaw plugin and drives rollback through registered 
 
   const api = {
     config: {
+      agents: {
+        list: [
+          {
+            id: "main",
+            name: "main",
+            workspace: fixture.workspace,
+            model: "gpt-test"
+          }
+        ]
+      },
       session: {
         storePath: transcript.sessionStoreTemplate
       },
@@ -646,94 +746,111 @@ test("registers a native OpenClaw plugin and drives rollback through registered 
     }
   };
 
-  const nativePlugin = createNativeStepRollbackPlugin();
-  const engine = await nativePlugin.register(api);
+  await writeOpenClawConfig(fixture.configPath, api.config);
 
-  assert.equal(nativeStepRollbackPlugin.id, "step-rollback");
-  assert.equal(engine.manifest.id, "step-rollback");
-  assert.equal(registered.methods.has("steprollback.status"), true);
-  assert.equal(registered.methods.has("steprollback.rollback"), true);
-  assert.equal(registered.hooks.has("session_start"), true);
-  assert.equal(registered.hooks.has("before_tool_call"), true);
-  assert.equal(typeof registered.hooks.get("before_tool_call").handler, "function");
-  assert.equal(registered.services.length, 1);
-  assert.equal(registered.clis.length, 1);
-  assert.deepEqual(registered.clis[0].meta.commands, ["steprollback"]);
+  await withTempEnv({
+    OPENCLAW_CONFIG_PATH: fixture.configPath,
+    OPENCLAW_STATE_DIR: fixture.root
+  }, async () => {
+    const nativePlugin = createNativeStepRollbackPlugin();
+    const engine = await nativePlugin.register(api);
 
-  const serviceStartResult = await registered.services[0].start();
-  assert.equal(serviceStartResult.pluginId, "step-rollback");
+    assert.equal(nativeStepRollbackPlugin.id, "step-rollback");
+    assert.equal(engine.manifest.id, "step-rollback");
+    assert.equal(registered.methods.has("steprollback.status"), true);
+    assert.equal(registered.methods.has("steprollback.rollback"), true);
+    assert.equal(registered.hooks.has("session_start"), true);
+    assert.equal(registered.hooks.has("before_tool_call"), true);
+    assert.equal(typeof registered.hooks.get("before_tool_call").handler, "function");
+    assert.equal(registered.services.length, 1);
+    assert.equal(registered.clis.length, 1);
+    assert.deepEqual(registered.clis[0].meta.commands, ["steprollback"]);
 
-  await registered.hooks.get("session_start").handler({
-    agentId: "main",
-    sessionId: "native-session",
-    runId: "run-native"
-  });
+    const serviceStartResult = await registered.services[0].start();
+    assert.equal(serviceStartResult.pluginId, "step-rollback");
 
-  await registered.hooks.get("before_tool_call").handler({
-    agentId: "main",
-    sessionId: "native-session",
-    toolName: "write",
-    toolCallId,
-    runId: "run-native"
-  });
-
-  await fs.writeFile(path.join(fixture.workspace, "native.txt"), "broken\n", "utf8");
-
-  const checkpointResponses = [];
-  await registered.methods.get("steprollback.checkpoints.list")({
-    params: {
-      agentId: "main",
-      sessionId: "native-session"
-    },
-    respond(ok, payload) {
-      checkpointResponses.push({ ok, payload });
-    }
-  });
-
-  assert.equal(checkpointResponses.length, 1);
-  assert.equal(checkpointResponses[0].ok, true);
-  assert.equal(checkpointResponses[0].payload.checkpoints.length, 1);
-
-  const checkpointId = checkpointResponses[0].payload.checkpoints[0].checkpointId;
-
-  const rollbackResponse = await registered.methods.get("steprollback.rollback")({
-    params: {
+    await registered.hooks.get("session_start").handler({
       agentId: "main",
       sessionId: "native-session",
-      checkpointId
-    }
-  });
+      runId: "run-native"
+    });
 
-  assert.equal(rollbackResponse.result, "success");
-  assert.equal(await fs.readFile(path.join(fixture.workspace, "native.txt"), "utf8"), "safe\n");
-  assert.equal(
-    gatewayCalls.some((call) => call.method === "agent" && call.params.message === "/stop"),
-    true
-  );
-
-  const continueResponse = await registered.methods.get("steprollback.continue")({
-    params: {
+    await registered.hooks.get("before_tool_call").handler({
       agentId: "main",
-      sessionId: "native-session"
-    }
-  });
+      sessionId: "native-session",
+      toolName: "write",
+      toolCallId,
+      runId: "run-native"
+    });
 
-  assert.equal(continueResponse.continued, true);
-  assert.equal(continueResponse.newSessionId, "native-session-branch");
-  assert.match(continueResponse.newSessionKey, /^agent:main:direct:step-rollback-br_0001$/);
-  assert.equal(
-    subagentCalls.some(
-      (call) =>
-        call.sessionKey === continueResponse.newSessionKey &&
-        call.message === "Continue from the restored checkpoint." &&
-        call.deliver === false
-    ),
-    true
-  );
-  assert.equal(logs.some((entry) => entry.message.includes("registered native OpenClaw plugin surfaces")), true);
-  assert.equal(logs.some((entry) => entry.message.includes("resolved config")), false);
-  assert.equal(logs.some((entry) => entry.message.includes("resolved tool checkpoint context")), true);
-  assert.equal(logs.some((entry) => entry.message.includes("git workspace status")), true);
+    await fs.writeFile(path.join(fixture.workspace, "native.txt"), "broken\n", "utf8");
+
+    const checkpointResponses = [];
+    await registered.methods.get("steprollback.checkpoints.list")({
+      params: {
+        agentId: "main",
+        sessionId: "native-session"
+      },
+      respond(ok, payload) {
+        checkpointResponses.push({ ok, payload });
+      }
+    });
+
+    assert.equal(checkpointResponses.length, 1);
+    assert.equal(checkpointResponses[0].ok, true);
+    assert.equal(checkpointResponses[0].payload.checkpoints.length, 1);
+
+    const checkpointId = checkpointResponses[0].payload.checkpoints[0].checkpointId;
+
+    const rollbackResponse = await registered.methods.get("steprollback.rollback")({
+      params: {
+        agentId: "main",
+        sessionId: "native-session",
+        checkpointId
+      }
+    });
+
+    assert.equal(rollbackResponse.result, "success");
+    assert.equal(await fs.readFile(path.join(fixture.workspace, "native.txt"), "utf8"), "safe\n");
+    assert.equal(
+      gatewayCalls.some((call) => call.method === "agent" && call.params.message === "/stop"),
+      true
+    );
+
+    const continueResponse = await registered.methods.get("steprollback.continue")({
+      params: {
+        agentId: "main",
+        sessionId: "native-session",
+        checkpointId,
+        prompt: "Inspect the checkpoint before changing anything."
+      }
+    });
+
+    assert.equal(continueResponse.continued, true);
+    assert.equal(continueResponse.newAgentId, "main-cp-0001");
+    assert.equal(continueResponse.newSessionKey, "agent:main-cp-0001:main");
+    assert.equal(await fs.readFile(path.join(continueResponse.newWorkspacePath, "native.txt"), "utf8"), "safe\n");
+    assert.equal(
+      subagentCalls.some(
+        (call) =>
+          call.sessionKey === continueResponse.newSessionKey &&
+          call.message === "Inspect the checkpoint before changing anything." &&
+          call.deliver === false
+      ),
+      true
+    );
+
+    const childConfig = JSON.parse(await fs.readFile(fixture.configPath, "utf8"));
+    assert.equal(childConfig.agents.list.some((entry) => entry.id === "main-cp-0001"), true);
+
+    const childTranscriptPath = path.join(fixture.root, "agents", "main-cp-0001", "sessions", `${continueResponse.newSessionId}.jsonl`);
+    const childTranscript = await fs.readFile(childTranscriptPath, "utf8");
+    assert.match(childTranscript, /entry-native/);
+    assert.equal(logs.some((entry) => entry.message.includes("registered native OpenClaw plugin surfaces")), true);
+    assert.equal(logs.some((entry) => entry.message.includes("resolved config")), false);
+    assert.equal(logs.some((entry) => entry.message.includes("resolved tool checkpoint context")), true);
+    assert.equal(logs.some((entry) => entry.message.includes("git workspace status")), true);
+  });
 });
 
 test("returns Gateway-style error payloads for native RPC handlers", async () => {
@@ -788,6 +905,86 @@ test("returns Gateway-style error payloads for native RPC handlers", async () =>
   assert.equal(responses.length, 1);
   assert.equal(responses[0].ok, false);
   assert.equal(responses[0].payload.code, "CHECKPOINT_NOT_FOUND");
+});
+
+test("setup patches openclaw.json and creates plugin directories", async () => {
+  const fixture = await createFixture();
+  const registered = {
+    clis: []
+  };
+  const existingConfig = {
+    gateway: {
+      auth: {
+        mode: "token"
+      }
+    },
+    plugins: {
+      allow: ["other-plugin"]
+    }
+  };
+
+  await writeOpenClawConfig(fixture.configPath, existingConfig);
+
+  const api = {
+    config: existingConfig,
+    logger: {
+      info() {},
+      warn() {},
+      error() {},
+      debug() {}
+    },
+    registerGatewayMethod() {},
+    registerHook() {},
+    on() {},
+    registerService() {},
+    registerCli(factory, meta) {
+      registered.clis.push({ factory, meta });
+    }
+  };
+
+  await withTempEnv({
+    OPENCLAW_CONFIG_PATH: fixture.configPath,
+    OPENCLAW_STATE_DIR: fixture.root
+  }, async () => {
+    await createNativeStepRollbackPlugin().register(api);
+
+    const cliHarness = createFakeProgram();
+    registered.clis[0].factory({ program: cliHarness.program });
+
+    const output = await captureConsoleLog(async () => {
+      await cliHarness.commands.get("steprollback setup").action({});
+    });
+
+    assert.match(output, /configPath/);
+
+    const patchedConfig = JSON.parse(await fs.readFile(fixture.configPath, "utf8"));
+    assert.equal(patchedConfig.gateway.auth.mode, "token");
+    assert.deepEqual(patchedConfig.plugins.allow, ["other-plugin", "step-rollback"]);
+    assert.equal(patchedConfig.plugins.enabled, true);
+    assert.equal(patchedConfig.plugins.entries["step-rollback"].enabled, true);
+    assert.deepEqual(
+      patchedConfig.plugins.entries["step-rollback"].config.workspaceRoots,
+      [path.join(fixture.root, "workspace")]
+    );
+    assert.equal(
+      patchedConfig.plugins.entries["step-rollback"].config.checkpointDir,
+      path.join(fixture.root, "plugins", "step-rollback", "checkpoints")
+    );
+
+    await fs.access(path.join(fixture.root, "workspace"));
+    await fs.access(path.join(fixture.root, "plugins", "step-rollback", "checkpoints"));
+    await fs.access(path.join(fixture.root, "plugins", "step-rollback", "registry"));
+    await fs.access(path.join(fixture.root, "plugins", "step-rollback", "runtime"));
+    await fs.access(path.join(fixture.root, "plugins", "step-rollback", "reports"));
+
+    const beforeDryRun = await fs.readFile(fixture.configPath, "utf8");
+    await cliHarness.commands.get("steprollback setup").action({
+      baseDir: path.join(fixture.root, "dry-run-root"),
+      dryRun: true
+    });
+    const afterDryRun = await fs.readFile(fixture.configPath, "utf8");
+    assert.equal(afterDryRun, beforeDryRun);
+  });
 });
 
 test("offers flag-based CLI commands for agents, sessions, rollback, and continue", async () => {
@@ -896,8 +1093,16 @@ test("offers flag-based CLI commands for agents, sessions, rollback, and continu
       async stopRun() {
         return { stopped: true, runId: "stop-cli" };
       },
-      async startContinueRun({ sessionId, entryId }) {
-        return { started: true, runId: `run:${sessionId}:${entryId}` };
+      async forkContinue({ branchId }) {
+        return {
+          started: true,
+          runId: `run:child:${branchId}`,
+          newAgentId: "main-cp-cli",
+          newWorkspacePath: path.join(fixture.root, "forks", "main-cp-cli"),
+          newAgentDir: path.join(fixture.root, "agents", "main-cp-cli"),
+          newSessionId: "session-checkout-cli",
+          newSessionKey: "agent:main-cp-cli:main"
+        };
       },
       async createSession() {
         return { sessionId: "session-checkout-cli" };
@@ -990,11 +1195,12 @@ test("offers flag-based CLI commands for agents, sessions, rollback, and continu
     await cliHarness.commands.get("steprollback continue").action({
       agent: "main",
       session: "session-cli",
+      checkpoint: checkpointId,
       prompt: "Inspect first."
     });
   });
   assert.match(continueOutput, /continued/);
-  assert.match(continueOutput, /usedPrompt/);
+  assert.match(continueOutput, /main-cp-cli/);
   assert.match(continueOutput, /session-checkout-cli/);
   assert.equal(
     cliGatewayCalls.some(
@@ -1002,6 +1208,7 @@ test("offers flag-based CLI commands for agents, sessions, rollback, and continu
         call.methodName === "steprollback.continue" &&
         call.params.agentId === "main" &&
         call.params.sessionId === "session-cli" &&
+        call.params.checkpointId === checkpointId &&
         call.params.prompt === "Inspect first."
     ),
     false
@@ -1133,6 +1340,7 @@ test("continues locally by spawning 'openclaw agent' and recording the new branc
     services: [],
     clis: []
   };
+  const subagentCalls = [];
   const fakeAgentCapturePath = path.join(fixture.root, "agent-capture.json");
   const fakeOpenclawPath = path.join(fixture.root, "fake-openclaw-agent");
   const sessionStoreTemplate = path.join(fixture.root, "agents", "{agentId}", "sessions", "sessions.json");
@@ -1146,8 +1354,6 @@ const fs = require("node:fs/promises");
   const args = process.argv.slice(2);
   await fs.writeFile(process.env.STEP_ROLLBACK_FAKE_AGENT_CAPTURE, JSON.stringify({ args }, null, 2));
   process.stdout.write(JSON.stringify({
-    sessionId: "branch-from-agent",
-    sessionKey: "agent:main:direct:branch-from-agent",
     runId: "run-branch-agent"
   }));
 })().catch((error) => {
@@ -1208,77 +1414,525 @@ const fs = require("node:fs/promises");
     },
     registerCli(factory, meta) {
       registered.clis.push({ factory, meta });
+    },
+    runtime: {
+      subagent: {
+        async run(params) {
+          subagentCalls.push(params);
+          return {
+            runId: "run-subagent-should-not-be-used"
+          };
+        }
+      }
     }
   };
 
   await fs.writeFile(path.join(fixture.workspace, "continue.txt"), "stable\n", "utf8");
 
-  await createNativeStepRollbackPlugin({
-    gatewayCommand: fakeOpenclawPath
-  }).register(api);
-
-  const cliHarness = createFakeProgram();
-  registered.clis[0].factory({ program: cliHarness.program });
-
-  await registered.hooks.get("session_start").handler({
-    agentId: "main",
-    sessionId: "session-continue-cli",
-    runId: "run-continue-cli"
-  });
-  await registered.hooks.get("before_tool_call").handler({
-    agentId: "main",
-    sessionId: "session-continue-cli",
-    entryId: "entry-continue-cli",
-    nodeIndex: 1,
-    toolName: "write",
-    params: {
-      file_path: path.join(fixture.workspace, "continue.txt"),
-      content: "broken\n"
-    },
-    runId: "run-continue-cli"
-  });
-  await fs.writeFile(path.join(fixture.workspace, "continue.txt"), "broken\n", "utf8");
-
-  const checkpointList = await registered.methods.get("steprollback.checkpoints.list")({
-    params: {
-      agentId: "main",
-      sessionId: "session-continue-cli"
+  await writeOpenClawConfig(fixture.configPath, api.config);
+  await writeSessionTranscript(fixture.root, "main", "session-continue-cli", [
+    {
+      type: "message",
+      id: "entry-continue-cli",
+      timestamp: "2026-03-17T12:00:00.000Z",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "toolcall-continue-cli",
+            name: "write",
+            arguments: {
+              file_path: path.join(fixture.workspace, "continue.txt"),
+              content: "broken\n"
+            }
+          }
+        ]
+      }
     }
-  });
-  const checkpointId = checkpointList.checkpoints[0].checkpointId;
+  ]);
 
-  await registered.methods.get("steprollback.rollback")({
-    params: {
+  await withTempEnv({
+    OPENCLAW_CONFIG_PATH: fixture.configPath,
+    OPENCLAW_STATE_DIR: fixture.root
+  }, async () => {
+    await createNativeStepRollbackPlugin({
+      gatewayCommand: fakeOpenclawPath
+    }).register(api);
+
+    const cliHarness = createFakeProgram();
+    registered.clis[0].factory({ program: cliHarness.program });
+
+    await registered.hooks.get("session_start").handler({
       agentId: "main",
       sessionId: "session-continue-cli",
-      checkpointId
-    }
+      runId: "run-continue-cli"
+    });
+    await registered.hooks.get("before_tool_call").handler({
+      agentId: "main",
+      sessionId: "session-continue-cli",
+      entryId: "entry-continue-cli",
+      nodeIndex: 1,
+      toolName: "write",
+      params: {
+        file_path: path.join(fixture.workspace, "continue.txt"),
+        content: "broken\n"
+      },
+      runId: "run-continue-cli"
+    });
+    await fs.writeFile(path.join(fixture.workspace, "continue.txt"), "broken\n", "utf8");
+
+    const checkpointList = await registered.methods.get("steprollback.checkpoints.list")({
+      params: {
+        agentId: "main",
+        sessionId: "session-continue-cli"
+      }
+    });
+    const checkpointId = checkpointList.checkpoints[0].checkpointId;
+
+    await registered.methods.get("steprollback.rollback")({
+      params: {
+        agentId: "main",
+        sessionId: "session-continue-cli",
+        checkpointId
+      }
+    });
+
+    const output = await withTempEnv({
+      STEP_ROLLBACK_FAKE_AGENT_CAPTURE: fakeAgentCapturePath
+    }, async () =>
+      captureConsoleLog(async () => {
+        await cliHarness.commands.get("steprollback continue").action({
+          agent: "main",
+          session: "session-continue-cli",
+          checkpoint: checkpointId,
+          prompt: "Check docs, but do not delete files."
+        });
+      })
+    );
+
+    assert.match(output, /continued/);
+    assert.match(output, /main-cp-0001/);
+    assert.equal(await fs.readFile(path.join(fixture.workspace, "continue.txt"), "utf8"), "stable\n");
+
+    const childConfig = JSON.parse(await fs.readFile(fixture.configPath, "utf8"));
+    const childAgent = childConfig.agents.list.find((entry) => entry.id === "main-cp-0001");
+    assert.ok(childAgent);
+    assert.deepEqual(Object.keys(childAgent).sort(), ["agentDir", "id", "model", "name", "workspace"]);
+    assert.equal(await fs.readFile(path.join(childAgent.workspace, "continue.txt"), "utf8"), "stable\n");
+
+    const capture = JSON.parse(await fs.readFile(fakeAgentCapturePath, "utf8"));
+    assert.equal(capture.args[0], "agent");
+    assert.equal(capture.args.includes("--agent"), true);
+    assert.equal(capture.args.includes("main-cp-0001"), true);
+    assert.equal(capture.args.includes("--session-id"), true);
+    assert.equal(capture.args.includes("--message"), true);
+    assert.equal(capture.args.includes("Check docs, but do not delete files."), true);
+    assert.equal(capture.args.includes("--json"), true);
+    assert.equal(capture.args.includes("gateway"), false);
+    assert.equal(subagentCalls.length, 0);
   });
+});
 
-  const output = await withTempEnv({
-    STEP_ROLLBACK_FAKE_AGENT_CAPTURE: fakeAgentCapturePath
-  }, async () =>
-    captureConsoleLog(async () => {
-      await cliHarness.commands.get("steprollback continue").action({
-        agent: "main",
-        session: "session-continue-cli",
-        prompt: "Check docs, but do not delete files."
-      });
-    })
+test("continue migrates legacy dynamic agent keys into agents.list before launching the child agent", async () => {
+  const fixture = await createFixture();
+  const registered = {
+    methods: new Map(),
+    hooks: new Map(),
+    services: [],
+    clis: []
+  };
+  const fakeAgentCapturePath = path.join(fixture.root, "agent-capture-migrate.json");
+  const fakeOpenclawPath = path.join(fixture.root, "fake-openclaw-agent-migrate");
+  const sessionStoreTemplate = path.join(fixture.root, "agents", "{agentId}", "sessions", "sessions.json");
+
+  await fs.writeFile(
+    fakeOpenclawPath,
+    `#!/usr/bin/env node
+const fs = require("node:fs/promises");
+
+(async () => {
+  const args = process.argv.slice(2);
+  await fs.writeFile(process.env.STEP_ROLLBACK_FAKE_AGENT_CAPTURE, JSON.stringify({ args }, null, 2));
+  process.stdout.write(JSON.stringify({ runId: "run-migrated-child" }));
+})().catch((error) => {
+  console.error(error && error.message ? error.message : String(error));
+  process.exit(1);
+});
+`,
+    "utf8"
   );
+  await fs.chmod(fakeOpenclawPath, 0o755);
 
-  assert.match(output, /continued/);
-  assert.match(output, /branch-from-agent/);
-  assert.equal(await fs.readFile(path.join(fixture.workspace, "continue.txt"), "utf8"), "stable\n");
+  const baseConfig = {
+    agents: {
+      defaults: {
+        model: {
+          primary: "vllm/Intern-S1-Pro"
+        },
+        workspace: fixture.workspace
+      },
+      "main-cp-0002": {
+        workspace: path.join(fixture.root, "legacy", "main-cp-0002")
+      }
+    },
+    session: {
+      storePath: sessionStoreTemplate
+    },
+    plugins: {
+      entries: {
+        "step-rollback": {
+          config: {
+            workspaceRoots: [fixture.workspace],
+            checkpointDir: fixture.checkpointDir,
+            registryDir: fixture.registryDir,
+            runtimeDir: fixture.runtimeDir,
+            reportsDir: fixture.reportsDir
+          }
+        }
+      }
+    }
+  };
 
-  const capture = JSON.parse(await fs.readFile(fakeAgentCapturePath, "utf8"));
-  assert.equal(capture.args[0], "agent");
-  assert.equal(capture.args.includes("--agent"), true);
-  assert.equal(capture.args.includes("main"), true);
-  assert.equal(capture.args.includes("--message"), true);
-  assert.equal(capture.args.includes("Check docs, but do not delete files."), true);
-  assert.equal(capture.args.includes("--json"), true);
-  assert.equal(capture.args.includes("gateway"), false);
+  const api = {
+    config: structuredClone(baseConfig),
+    logger: {
+      info() {},
+      warn() {},
+      error() {},
+      debug() {}
+    },
+    registerGatewayMethod(name, handler) {
+      registered.methods.set(name, handler);
+    },
+    registerHook(name, handler, options) {
+      registered.hooks.set(name, { handler, options });
+    },
+    on(name, handler, options) {
+      registered.hooks.set(name, { handler, options });
+    },
+    registerService(service) {
+      registered.services.push(service);
+    },
+    registerCli(factory, meta) {
+      registered.clis.push({ factory, meta });
+    }
+  };
+
+  await fs.writeFile(path.join(fixture.workspace, "migrate.txt"), "stable\n", "utf8");
+  await writeOpenClawConfig(fixture.configPath, baseConfig);
+  await writeSessionTranscript(fixture.root, "main", "session-migrate", [
+    {
+      type: "message",
+      id: "entry-migrate",
+      timestamp: "2026-03-17T12:00:00.000Z",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "toolcall-migrate",
+            name: "write",
+            arguments: {
+              file_path: path.join(fixture.workspace, "migrate.txt"),
+              content: "broken\n"
+            }
+          }
+        ]
+      }
+    }
+  ]);
+
+  await withTempEnv({
+    OPENCLAW_CONFIG_PATH: fixture.configPath,
+    OPENCLAW_STATE_DIR: fixture.root,
+    STEP_ROLLBACK_FAKE_AGENT_CAPTURE: fakeAgentCapturePath
+  }, async () => {
+    await createNativeStepRollbackPlugin({
+      gatewayCommand: fakeOpenclawPath
+    }).register(api);
+
+    const cliHarness = createFakeProgram();
+    registered.clis[0].factory({ program: cliHarness.program });
+
+    await registered.hooks.get("session_start").handler({
+      agentId: "main",
+      sessionId: "session-migrate",
+      runId: "run-migrate"
+    });
+    await registered.hooks.get("before_tool_call").handler({
+      agentId: "main",
+      sessionId: "session-migrate",
+      entryId: "entry-migrate",
+      nodeIndex: 1,
+      toolName: "write",
+      params: {
+        file_path: path.join(fixture.workspace, "migrate.txt"),
+        content: "broken\n"
+      },
+      runId: "run-migrate"
+    });
+
+    const checkpointList = await registered.methods.get("steprollback.checkpoints.list")({
+      params: {
+        agentId: "main",
+        sessionId: "session-migrate"
+      }
+    });
+
+    await cliHarness.commands.get("steprollback continue").action({
+      agent: "main",
+      session: "session-migrate",
+      checkpoint: checkpointList.checkpoints[0].checkpointId,
+      prompt: "Write the script."
+    });
+
+    const migratedConfig = JSON.parse(await fs.readFile(fixture.configPath, "utf8"));
+    assert.equal("main-cp-0002" in migratedConfig.agents, false);
+    assert.ok(Array.isArray(migratedConfig.agents.list));
+    assert.equal(migratedConfig.agents.list.some((entry) => entry.id === "main-cp-0002"), true);
+    assert.equal(migratedConfig.agents.list.some((entry) => entry.id === "main-cp-0001"), true);
+    const migratedLegacyChild = migratedConfig.agents.list.find((entry) => entry.id === "main-cp-0002");
+    const newChild = migratedConfig.agents.list.find((entry) => entry.id === "main-cp-0001");
+    assert.equal(migratedLegacyChild.id, "main-cp-0002");
+    assert.equal(migratedLegacyChild.name, "main-cp-0002");
+    assert.ok(migratedLegacyChild.workspace);
+    assert.equal("workspaceRoot" in migratedLegacyChild, false);
+    assert.equal("cwd" in migratedLegacyChild, false);
+    assert.equal("root" in migratedLegacyChild, false);
+    assert.equal("models" in migratedLegacyChild, false);
+    assert.equal("compaction" in migratedLegacyChild, false);
+    assert.equal("maxConcurrent" in migratedLegacyChild, false);
+    assert.equal(newChild.id, "main-cp-0001");
+    assert.equal(newChild.name, "main-cp-0001");
+    assert.ok(newChild.workspace);
+    assert.equal("workspaceRoot" in newChild, false);
+    assert.equal("cwd" in newChild, false);
+    assert.equal("root" in newChild, false);
+    assert.equal("models" in newChild, false);
+    assert.equal("compaction" in newChild, false);
+    assert.equal("maxConcurrent" in newChild, false);
+
+    const capture = JSON.parse(await fs.readFile(fakeAgentCapturePath, "utf8"));
+    assert.equal(capture.args.includes("main-cp-0001"), true);
+  });
+});
+
+test("continue repairs stale plugin-managed fork entries in agents.list before launching the child agent", async () => {
+  const fixture = await createFixture();
+  const registered = {
+    methods: new Map(),
+    hooks: new Map(),
+    services: [],
+    clis: []
+  };
+  const fakeAgentCapturePath = path.join(fixture.root, "agent-capture-repair.json");
+  const fakeOpenclawPath = path.join(fixture.root, "fake-openclaw-agent-repair");
+  const sessionStoreTemplate = path.join(fixture.root, "agents", "{agentId}", "sessions", "sessions.json");
+  const legacyWorkspace = path.join(fixture.root, "legacy-fork", "main-cp-0003");
+  const legacyAgentDir = path.join(fixture.root, "agents", "main-cp-0003");
+
+  await fs.writeFile(
+    fakeOpenclawPath,
+    `#!/usr/bin/env node
+const fs = require("node:fs/promises");
+
+(async () => {
+  const args = process.argv.slice(2);
+  await fs.writeFile(process.env.STEP_ROLLBACK_FAKE_AGENT_CAPTURE, JSON.stringify({ args }, null, 2));
+  process.stdout.write(JSON.stringify({ runId: "run-repaired-child" }));
+})().catch((error) => {
+  console.error(error && error.message ? error.message : String(error));
+  process.exit(1);
+});
+`,
+    "utf8"
+  );
+  await fs.chmod(fakeOpenclawPath, 0o755);
+
+  const baseConfig = {
+    agents: {
+      defaults: {
+        model: {
+          primary: "vllm/Intern-S1-Pro"
+        },
+        models: {
+          "vllm/Intern-S1-Pro": {}
+        },
+        workspace: fixture.workspace,
+        compaction: {
+          mode: "safeguard"
+        }
+      },
+      list: [
+        {
+          model: {
+            primary: "vllm/Intern-S1-Pro"
+          },
+          models: {
+            "vllm/Intern-S1-Pro": {}
+          },
+          compaction: {
+            mode: "safeguard"
+          },
+          maxConcurrent: 4,
+          subagents: {
+            maxConcurrent: 8
+          },
+          id: "main-cp-0003",
+          name: "main-cp-0003",
+          workspace: legacyWorkspace,
+          workspaceRoot: legacyWorkspace,
+          cwd: legacyWorkspace,
+          root: legacyWorkspace,
+          agentDir: legacyAgentDir
+        }
+      ]
+    },
+    session: {
+      storePath: sessionStoreTemplate
+    },
+    plugins: {
+      entries: {
+        "step-rollback": {
+          config: {
+            workspaceRoots: [fixture.workspace],
+            checkpointDir: fixture.checkpointDir,
+            registryDir: fixture.registryDir,
+            runtimeDir: fixture.runtimeDir,
+            reportsDir: fixture.reportsDir
+          }
+        }
+      }
+    }
+  };
+
+  const api = {
+    config: structuredClone(baseConfig),
+    logger: {
+      info() {},
+      warn() {},
+      error() {},
+      debug() {}
+    },
+    registerGatewayMethod(name, handler) {
+      registered.methods.set(name, handler);
+    },
+    registerHook(name, handler, options) {
+      registered.hooks.set(name, { handler, options });
+    },
+    on(name, handler, options) {
+      registered.hooks.set(name, { handler, options });
+    },
+    registerService(service) {
+      registered.services.push(service);
+    },
+    registerCli(factory, meta) {
+      registered.clis.push({ factory, meta });
+    }
+  };
+
+  await fs.mkdir(legacyWorkspace, { recursive: true });
+  await fs.mkdir(path.join(legacyAgentDir, "sessions"), { recursive: true });
+  await fs.writeFile(path.join(fixture.workspace, "repair.txt"), "stable\n", "utf8");
+  await writeOpenClawConfig(fixture.configPath, baseConfig);
+  await writeSessionTranscript(fixture.root, "main", "session-repair", [
+    {
+      type: "message",
+      id: "entry-repair",
+      timestamp: "2026-03-17T12:00:00.000Z",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "toolcall-repair",
+            name: "write",
+            arguments: {
+              file_path: path.join(fixture.workspace, "repair.txt"),
+              content: "broken\n"
+            }
+          }
+        ]
+      }
+    }
+  ]);
+
+  await withTempEnv({
+    OPENCLAW_CONFIG_PATH: fixture.configPath,
+    OPENCLAW_STATE_DIR: fixture.root,
+    STEP_ROLLBACK_FAKE_AGENT_CAPTURE: fakeAgentCapturePath
+  }, async () => {
+    await createNativeStepRollbackPlugin({
+      gatewayCommand: fakeOpenclawPath
+    }).register(api);
+
+    const cliHarness = createFakeProgram();
+    registered.clis[0].factory({ program: cliHarness.program });
+
+    await registered.hooks.get("session_start").handler({
+      agentId: "main",
+      sessionId: "session-repair",
+      runId: "run-repair"
+    });
+    await registered.hooks.get("before_tool_call").handler({
+      agentId: "main",
+      sessionId: "session-repair",
+      entryId: "entry-repair",
+      nodeIndex: 1,
+      toolName: "write",
+      params: {
+        file_path: path.join(fixture.workspace, "repair.txt"),
+        content: "broken\n"
+      },
+      runId: "run-repair"
+    });
+
+    const checkpointList = await registered.methods.get("steprollback.checkpoints.list")({
+      params: {
+        agentId: "main",
+        sessionId: "session-repair"
+      }
+    });
+
+    await cliHarness.commands.get("steprollback continue").action({
+      agent: "main",
+      session: "session-repair",
+      checkpoint: checkpointList.checkpoints[0].checkpointId,
+      prompt: "Resume from the repaired checkpoint."
+    });
+
+    const repairedConfig = JSON.parse(await fs.readFile(fixture.configPath, "utf8"));
+    const repairedLegacyChild = repairedConfig.agents.list.find((entry) => entry.id === "main-cp-0003");
+    const newChild = repairedConfig.agents.list.find((entry) => entry.id === "main-cp-0001");
+
+    assert.ok(repairedLegacyChild);
+    assert.equal(repairedLegacyChild.workspace, legacyWorkspace);
+    assert.equal("workspaceRoot" in repairedLegacyChild, false);
+    assert.equal("cwd" in repairedLegacyChild, false);
+    assert.equal("root" in repairedLegacyChild, false);
+    assert.equal("models" in repairedLegacyChild, false);
+    assert.equal("compaction" in repairedLegacyChild, false);
+    assert.equal("maxConcurrent" in repairedLegacyChild, false);
+    assert.equal("subagents" in repairedLegacyChild, false);
+
+    assert.ok(newChild);
+    assert.equal("workspaceRoot" in newChild, false);
+    assert.equal("cwd" in newChild, false);
+    assert.equal("root" in newChild, false);
+    assert.equal("models" in newChild, false);
+    assert.equal("compaction" in newChild, false);
+    assert.equal("maxConcurrent" in newChild, false);
+    assert.ok(newChild.workspace);
+
+    assert.equal(repairedConfig.agents.defaults.maxConcurrent, 4);
+    assert.deepEqual(repairedConfig.agents.defaults.models, {
+      "vllm/Intern-S1-Pro": {}
+    });
+
+    const capture = JSON.parse(await fs.readFile(fakeAgentCapturePath, "utf8"));
+    assert.equal(capture.args.includes("main-cp-0001"), true);
+  });
 });
 
 test("maps agents.defaults to main and accepts default aliases in CLI and Gateway methods", async () => {

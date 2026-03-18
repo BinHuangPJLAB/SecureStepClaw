@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { readJson, resolveAbsolutePath } from "../core/utils.js";
+import { nowIso, readJson, resolveAbsolutePath } from "../core/utils.js";
 import { manifest } from "../plugin.js";
 import { pickFirst, pickInteger, pickNonEmptyString, unwrapRpcResult } from "./shared.js";
 
@@ -103,7 +103,7 @@ function timestampSortValue(...values) {
   return 0;
 }
 
-function resolveSessionTranscriptPath(api, agentId, sessionId) {
+export function resolveSessionTranscriptPath(api, agentId, sessionId) {
   const configuredPath = pickFirst(
     api?.config?.session?.storePath,
     api?.config?.session?.indexPath,
@@ -234,6 +234,7 @@ export async function resolveToolHookContext(api, engine, normalized, logger) {
       enriched.entryId = enriched.entryId ?? transcriptMatch.entryId;
       enriched.nodeIndex = Number.isInteger(enriched.nodeIndex) ? enriched.nodeIndex : transcriptMatch.nodeIndex;
       enriched.params = enriched.params ?? transcriptMatch.params;
+      enriched.transcriptPath = enriched.transcriptPath ?? transcriptMatch.transcriptPath;
       logger.info?.(
         `[${manifest.id}] resolved tool checkpoint context from transcript toolCallId='${enriched.toolCallId}' entry='${enriched.entryId}' node='${enriched.nodeIndex}'`
       );
@@ -562,6 +563,119 @@ async function writeSessionIndexState(sessionIndexPath, contents) {
   await fs.writeFile(sessionIndexPath, `${JSON.stringify(contents, null, 2)}\n`, "utf8");
 }
 
+function normalizeTranscriptEntries(entries) {
+  if (!Array.isArray(entries)) {
+    return [];
+  }
+
+  return entries.filter((entry) => entry && typeof entry === "object");
+}
+
+export async function readSessionTranscriptEntries(api, agentId, sessionId) {
+  const transcriptPath = resolveSessionTranscriptPath(api, agentId, sessionId);
+  const contents = await fs.readFile(transcriptPath, "utf8");
+  const entries = contents
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+
+  return {
+    transcriptPath,
+    entries: normalizeTranscriptEntries(entries)
+  };
+}
+
+export async function writeSessionTranscriptEntries(api, agentId, sessionId, entries) {
+  const transcriptPath = resolveSessionTranscriptPath(api, agentId, sessionId);
+  const normalizedEntries = normalizeTranscriptEntries(entries);
+
+  await fs.mkdir(path.dirname(transcriptPath), { recursive: true });
+  await fs.writeFile(
+    transcriptPath,
+    normalizedEntries.length
+      ? `${normalizedEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`
+      : "",
+    "utf8"
+  );
+
+  return {
+    transcriptPath,
+    entries: normalizedEntries
+  };
+}
+
+function normalizeSessionRecordPayload(record = {}) {
+  const sessionId = pickNonEmptyString(record.sessionId, record.id);
+  const sessionKey = pickNonEmptyString(record.sessionKey, record.key);
+  const label = pickNonEmptyString(record.label, record.title) || "(untitled)";
+  const createdAt = pickNonEmptyString(record.createdAt, record.startedAt) || nowIso();
+  const updatedAt = pickNonEmptyString(record.updatedAt, record.lastUpdatedAt, record.lastActivityAt) || createdAt;
+  const branchOf = pickNonEmptyString(record.branchOf, record.sourceSessionId);
+
+  return {
+    sessionId,
+    sessionKey,
+    title: label,
+    label,
+    createdAt,
+    updatedAt,
+    branchOf: branchOf || undefined,
+    sourceSessionId: branchOf || undefined
+  };
+}
+
+export async function upsertSessionRecord(api, agentId, record, options = {}) {
+  const normalizedAgentId = normalizeAgentIdInput(api, agentId);
+  const state = await readSessionIndexState(api, normalizedAgentId);
+  const nextRecord = normalizeSessionRecordPayload(record);
+  const referenceKey = nextRecord.sessionKey || nextRecord.sessionId;
+  let nextContents = state.contents;
+
+  if (Array.isArray(nextContents) || options.shape === "array") {
+    const currentEntries = Array.isArray(nextContents) ? nextContents : [];
+    const filteredEntries = currentEntries.filter((entry) => {
+      const entrySessionId = pickNonEmptyString(entry?.sessionId, entry?.id);
+      const entrySessionKey = pickNonEmptyString(entry?.sessionKey, entry?.key);
+      return entrySessionId !== nextRecord.sessionId && entrySessionKey !== nextRecord.sessionKey;
+    });
+
+    nextContents = [
+      ...filteredEntries,
+      {
+        ...nextRecord
+      }
+    ];
+  } else {
+    const currentEntries = nextContents && typeof nextContents === "object" ? nextContents : {};
+    nextContents = {
+      ...currentEntries,
+      [referenceKey]: {
+        ...(currentEntries[referenceKey] && typeof currentEntries[referenceKey] === "object"
+          ? currentEntries[referenceKey]
+          : {}),
+        ...nextRecord
+      }
+    };
+  }
+
+  await writeSessionIndexState(state.sessionIndexPath, nextContents);
+
+  return {
+    agentId: normalizedAgentId,
+    sessionIndexPath: state.sessionIndexPath,
+    record: nextRecord,
+    contents: nextContents
+  };
+}
+
 export async function annotateBranchSessionRecord(api, agentId, reference, metadata, logger) {
   const sessionId = pickNonEmptyString(reference?.sessionId);
   const sessionKey = pickNonEmptyString(reference?.sessionKey);
@@ -643,6 +757,10 @@ export async function annotateBranchSessionRecord(api, agentId, reference, metad
 
 export function buildBranchSessionKey(agentId, branchId) {
   return `agent:${sanitizeSessionToken(agentId, "main")}:direct:step-rollback-${sanitizeSessionToken(branchId, "branch")}`;
+}
+
+export function buildAgentSessionKey(agentId) {
+  return `agent:${sanitizeSessionToken(agentId, "main")}:main`;
 }
 
 export function buildBranchSessionLabel(sourceSessionId, branchId) {

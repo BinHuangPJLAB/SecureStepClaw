@@ -266,7 +266,8 @@ export class CheckpointManager {
       sessionRuntime: {
         included: true,
         fileName: "runtime-state.json"
-      }
+      },
+      sessionTranscript: null
     };
 
     for (const rootPath of this.config.workspaceRoots) {
@@ -276,6 +277,7 @@ export class CheckpointManager {
     }
 
     await writeJson(path.join(snapshotRoot, "runtime-state.json"), runtimeState);
+    manifest.sessionTranscript = await this.captureTranscriptPrefix(snapshotRoot, ctx);
     await writeJson(path.join(snapshotRoot, "snapshot.json"), manifest);
 
     const record = {
@@ -298,7 +300,8 @@ export class CheckpointManager {
         commitId: entry.commitId ?? null
       })),
       status: "ready",
-      summary: buildCheckpointSummary(ctx)
+      summary: buildCheckpointSummary(ctx),
+      transcriptSnapshot: manifest.sessionTranscript
     };
 
     await this.registry.add(record);
@@ -358,12 +361,23 @@ export class CheckpointManager {
       ...ctx,
       toolName: ctx.toolName ?? candidate.toolName
     });
+    const transcriptSnapshot = await this.captureTranscriptPrefix(candidate.snapshotRef, {
+      ...candidate,
+      ...ctx,
+      entryId: ctx.entryId ?? candidate.entryId,
+      sessionId: ctx.sessionId ?? candidate.sessionId,
+      agentId: ctx.agentId ?? candidate.agentId,
+      transcriptPath: ctx.transcriptPath
+    });
 
     return this.registry.update(candidate.checkpointId, (current) => {
       current.entryId = ctx.entryId;
       current.nodeIndex = ctx.nodeIndex;
       current.toolCallId = ctx.toolCallId ?? current.toolCallId ?? null;
       current.summary = nextSummary;
+      if (transcriptSnapshot) {
+        current.transcriptSnapshot = transcriptSnapshot;
+      }
       return current;
     });
   }
@@ -428,6 +442,48 @@ export class CheckpointManager {
     }
   }
 
+  async materialize(checkpointId, options = {}) {
+    const record = await this.registry.get(checkpointId);
+
+    if (!record) {
+      throw new StepRollbackError("CHECKPOINT_NOT_FOUND", `Checkpoint '${checkpointId}' was not found.`, {
+        checkpointId
+      });
+    }
+
+    const manifest = await readJson(path.join(record.snapshotRef, "snapshot.json"), null);
+
+    if (!manifest) {
+      throw new StepRollbackError(
+        "SNAPSHOT_RESTORE_FAILED",
+        `Snapshot manifest for checkpoint '${checkpointId}' is missing.`,
+        { checkpointId }
+      );
+    }
+
+    const materializedEntries = [];
+
+    for (const [index, entry] of manifest.workspaceEntries.entries()) {
+      const targetPath = typeof options.resolveTargetPath === "function"
+        ? options.resolveTargetPath(entry, index, manifest.workspaceEntries)
+        : entry.targetPath;
+      const materializedEntry = {
+        ...entry,
+        targetPath
+      };
+
+      await this.restoreWorkspaceEntry(record.snapshotRef, materializedEntry);
+      materializedEntries.push(materializedEntry);
+    }
+
+    return {
+      checkpointId,
+      snapshotRef: record.snapshotRef,
+      workspaceEntries: materializedEntries,
+      transcriptSnapshot: manifest.sessionTranscript ?? record.transcriptSnapshot ?? null
+    };
+  }
+
   async restoreWorkspaceEntry(snapshotRoot, entry) {
     if (entry.backend === "git") {
       await this.restoreGitWorkspaceEntry(entry);
@@ -451,6 +507,65 @@ export class CheckpointManager {
     }
 
     await replacePathWithCopy(snapshotPath, entry.targetPath, entry.kind);
+  }
+
+  async captureTranscriptPrefix(snapshotRoot, ctx) {
+    const transcriptPath = typeof ctx?.transcriptPath === "string" && ctx.transcriptPath.trim()
+      ? ctx.transcriptPath.trim()
+      : "";
+    const entryId = typeof ctx?.entryId === "string" && ctx.entryId.trim() ? ctx.entryId.trim() : "";
+
+    if (!transcriptPath || !entryId) {
+      return null;
+    }
+
+    try {
+      const contents = await fs.readFile(transcriptPath, "utf8");
+      const lines = contents
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+      const prefixLines = [];
+      let matched = false;
+
+      for (const line of lines) {
+        prefixLines.push(line);
+
+        try {
+          const entry = JSON.parse(line);
+
+          if (entry?.id === entryId) {
+            matched = true;
+            break;
+          }
+        } catch {
+          continue;
+        }
+      }
+
+      if (!matched || !prefixLines.length) {
+        return null;
+      }
+
+      const fileName = "transcript-prefix.jsonl";
+      await fs.writeFile(path.join(snapshotRoot, fileName), `${prefixLines.join("\n")}\n`, "utf8");
+
+      return {
+        included: true,
+        fileName,
+        entryCount: prefixLines.length,
+        sourcePath: transcriptPath
+      };
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+        this.logger.warn?.(
+          `[step-rollback] transcript snapshot skipped because source transcript was missing: ${transcriptPath}`
+        );
+        return null;
+      }
+
+      throw error;
+    }
   }
 
   async createWorkspaceSnapshotEntry(snapshotRoot, checkpointId, ctx, rootPath) {
